@@ -1,0 +1,7 @@
+/.quarto/
+/_site/
+**/*.quarto_ipynb
+/.claude/
+
+# 还没写完的文章：写完后删掉对应的行，再提交
+/posts/linear-attention-history/

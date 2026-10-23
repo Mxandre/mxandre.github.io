@@ -1,0 +1,30 @@
+project:
+  type: website
+
+lang: zh
+
+website:
+  title: "技术调研笔记"
+  description: "工程 + 理论视角的技术调研"
+  site-url: https://mxandre.github.io
+  navbar:
+    right:
+      - about.qmd
+      - icon: github
+        href: https://github.com/Mxandre
+      - icon: rss
+        href: index.xml
+
+format:
+  html:
+    theme:
+      light: cosmo
+      dark: darkly
+    css: styles.css
+    toc: true
+    toc-location: right
+    toc-title: "目录"
+    html-math-method: mathjax
+    reference-location: margin
+    code-copy: true
+    link-external-newwindow: true

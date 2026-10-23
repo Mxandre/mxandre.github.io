@@ -1,0 +1,4 @@
+# Local preview profile: `.\quarto.cmd preview --profile dev`
+# Drafts are visible here but stay hidden in the published site.
+website:
+  draft-mode: visible
