@@ -1,0 +1,863 @@
+---
+title: "让 Attention 更快（1）：Linear Attention 与 FlashAttention"
+subtitle: "两种思路：改「算什么」，还是改「怎么算」"
+date: "2026-10-26"
+categories: [attention, linear-attention, flash-attention]
+bibliography: references.bib
+---
+
+::: {.callout-note}
+English version: [Read in English](en.qmd)
+
+Attention 这个系列的文章正在撰写，持续更新，更新进度与调研进度同步。当前第一篇（1）已完成。
+
+文中延伸提到的一些工作（比如 Performer、Based、Gated DeltaNet 等）目前只做了简要介绍，还没有深入调研，之后读完会继续补充。如果你发现文中有错误或不准确的地方，非常欢迎在文末的评论区指出，一起交流讨论。
+:::
+
+Transformer 是今天几乎所有大模型的地基，而它的核心部件 attention 有一个问题：代价随序列长度的平方增长。本系列会尝试讲清楚现在出现的解决方法，第一篇文章先介绍以下两种方法的思想：
+
+- **FlashAttention**（2022）[@dao2022flashattention]：改「怎么算」。数学上完全不变，只改变计算的组织方式，速度和显存都大幅改善。
+- **Linear Attention**（2020）[@katharopoulos2020transformers]：改「算什么」。换一种计算相似度的方式，让计算量从平方降到线性。
+
+在讲这两种方法之前，我们先要弄清楚：标准的 attention 到底贵在哪里？
+
+::: {.callout-tip}
+## 阅读建议
+正文尽量只用直觉和小例子讲清楚思路。公式推导都放在可折叠的框里，第一次读可以直接跳过。
+:::
+
+## 从 RNN 到 Transformer
+
+在 Transformer 出现之前，处理文本这类序列数据的主力是循环神经网络（RNN），比如 LSTM [@hochreiter1997long]。RNN 读句子的方式和人很像：一个词一个词地读，每读一个词，就把它和之前的“记忆”（隐藏状态）融合，更新记忆，再去读下一个词。
+
+这种方式有两个硬伤：
+
+- **训练慢**：第 $t$ 步必须等第 $t-1$ 步算完才能开始，一句话里的词只能排队处理，没法充分利用 GPU 的并行能力。
+- **远处的信息容易丢**：第 1 个词的信息要一步一步传递，才能到达第 1000 个词，一路上不断被新的信息冲淡。
+
+2017 年，Transformer [@vaswani2017attention] 彻底去掉了循环结构，只用 attention（注意力机制）来建模词与词之间的关系^[attention 机制本身出现得更早：@bahdanau2015neural 在基于 RNN 的翻译模型里用它来对齐源句和目标句。Transformer 的新意在于完全去掉循环，只靠 attention。]。在 attention 里，每个词都可以**直接**看到序列中的所有词，不需要一步步传话；而且所有词的计算可以同时进行，训练能充分利用 GPU 的并行能力。这两个优点让 Transformer 能被扩展到前所未有的规模，GPT、BERT 以及今天几乎所有的大语言模型都建立在它之上。
+
+但“每个词都直接看所有词”并不是免费的：$N$ 个词两两之间都要打一次交道，代价随 $N^2$ 增长（@fig-pairs）。下面我们就来仔细算一算这笔账。
+
+::: {#fig-pairs}
+{{< include _fig-pairs.qmd >}}
+
+attention 要让每个词都和每个词配对打一次分。左：4 个词两两配对，一共 16 条连线，高亮的是“苹果”去看所有词。右：每条连线对应分数矩阵里的一个格子。下：词数 $N$ 每翻一倍，格子数就变成 4 倍。
+:::
+
+## Attention 在算什么
+
+### 直观理解：查询、键、值
+
+attention 给每个词准备三个向量：
+
+- **query（查询）**：我想找什么样的信息？
+- **key（键）**：我这里有什么样的信息？相当于一个标签。
+- **value（值）**：我的信息具体是什么内容。
+
+可以把它想象成在图书馆查资料：query 是你的检索词，key 是每本书的书名和标签，value 是书的内容。你拿检索词和每本书的标签比对，越相关的书读得越多，最后把读到的内容按相关程度综合起来。
+
+对应到计算上，每个词都做三步：
+
+1. **打分**：用自己的 query 和所有词的 key 做点积，点积越大，表示越相关；
+2. **归一化**：用 softmax 把这些分数变成一组加起来等于 1 的权重；
+3. **加权平均**：用这组权重对所有词的 value 求加权平均，作为自己的输出。
+
+### 写成公式
+
+设输入有 $N$ 个词，每个词是一个 $D$ 维向量，排成矩阵 $X \in \mathbb{R}^{N \times D}$。先用三个可学习的矩阵，把它投影成 query、key、value：
+
+$$
+Q = XW_Q, \quad K = XW_K, \quad V = XW_V, \qquad Q, K, V \in \mathbb{R}^{N \times d}.
+$$
+
+attention 的输出是
+
+$$
+S = \frac{QK^\top}{\sqrt{d}}, \qquad P = \operatorname{softmax}(S), \qquad O = PV.
+$$ {#eq-attention}
+
+- $S \in \mathbb{R}^{N \times N}$ 是**分数矩阵**：$S_{ij}$ 表示第 $i$ 个词的 query 和第 $j$ 个词的 key 有多匹配。
+- softmax 对 $S$ 的**每一行**单独做。第 $i$ 行变成第 $i$ 个词分配给所有词的权重，合起来记为 $P$。
+- $O \in \mathbb{R}^{N \times d}$ 是输出，第 $i$ 行是所有 value 按第 $i$ 行权重求出的加权平均。
+
+除以 $\sqrt{d}$ 是为了防止点积过大^[$d$ 越大，点积的数值往往越大，softmax 会变得过于“尖锐”，几乎所有权重都集中到一个词上，导致梯度很小。除以 $\sqrt{d}$ 能把数值拉回合理的范围 [@vaswani2017attention]。]。
+
+另外还有两个实际中一定会用到的细节：
+
+- **因果掩码**：GPT 这类语言模型是从左到右生成文字的，第 $i$ 个词只能看到它自己和前面的词，不能“偷看”后面的词。做法是在 softmax 之前，把 $S$ 中 $j > i$ 的位置（矩阵的右上三角）设为 $-\infty$，这些位置的权重就变成了 0。
+- **多头注意力**：实际中会把 $D$ 维分成 $h$ 份，每份 $d = D/h$ 维，各自独立做一遍 attention（每一份称为一个“头”），最后把结果拼起来。不同的头可以关注不同类型的关系。
+
+### 动手算一个小例子
+
+取 3 个词，$d = 2$。为了好算，这里省略除以 $\sqrt{d}$ 这一步，也不加因果掩码：
+
+$$
+Q = \begin{bmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{bmatrix}, \quad
+K = \begin{bmatrix} 1 & 1 \\ 0 & 1 \\ 1 & 0 \end{bmatrix}, \quad
+V = \begin{bmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{bmatrix}.
+$$
+
+**第一步，打分。** $S = QK^\top$ 的第 $i$ 行第 $j$ 列，是第 $i$ 个 query 和第 $j$ 个 key 的点积。比如第 3 个词的 query 是 $(1, 1)$，它和第 1 个 key $(1, 1)$ 的点积是 $1 \times 1 + 1 \times 1 = 2$。全部算完：
+
+$$
+S = \begin{bmatrix} 1 & 0 & 1 \\ 1 & 1 & 0 \\ 2 & 1 & 1 \end{bmatrix}.
+$$
+
+**第二步，softmax。** 对每一行取指数，再除以这一行的和。以第 3 行为例：$e^2 \approx 7.39$，$e^1 \approx 2.72$，三者之和是 $7.39 + 2.72 + 2.72 = 12.83$，所以权重是 $7.39 / 12.83 \approx 0.58$ 和 $2.72 / 12.83 \approx 0.21$。三行都算完：
+
+$$
+P = \begin{bmatrix} 0.42 & 0.16 & 0.42 \\ 0.42 & 0.42 & 0.16 \\ 0.58 & 0.21 & 0.21 \end{bmatrix}.
+$$
+
+**第三步，加权平均。** 第 3 个词的输出是 $0.58 \times (1, 0) + 0.21 \times (0, 1) + 0.21 \times (1, 1) = (0.79, 0.42)$。三行都算完：
+
+$$
+O = PV = \begin{bmatrix} 0.84 & 0.58 \\ 0.58 & 0.58 \\ 0.79 & 0.42 \end{bmatrix}.
+$$
+
+**请留意 $S$ 和 $P$ 的形状。** 3 个词产生了 $3 \times 3 = 9$ 个分数，因为每一对词都要打一次分（@fig-pairs 里的一条连线，就是矩阵里的一个格子）。$N$ 个词就有 $N \times N$ 个分数：
+
+| 序列长度 $N$ | 分数个数 $N^2$ |
+|---|---|
+| 3 | 9 |
+| 1K（1,024） | 约 105 万 |
+| 4K（4,096） | 约 1,678 万 |
+| 128K（131,072） | 约 172 亿 |
+
+: 分数矩阵的大小随序列长度平方增长 {#tbl-n2}
+
+这张 $N \times N$ 的分数表，就是后面所有麻烦的根源。
+
+用 PyTorch 写出来只有几行：
+
+```python
+import torch
+
+def standard_attention(Q, K, V, causal=True):
+    """Q, K, V: (N, d)"""
+    N, d = Q.shape
+    S = Q @ K.T / d**0.5                          # (N, N) 分数矩阵
+    if causal:                                    # 屏蔽右上三角，也就是"未来"的词
+        future = torch.triu(torch.ones(N, N, dtype=torch.bool, device=Q.device), diagonal=1)
+        S = S.masked_fill(future, float("-inf"))
+    P = torch.softmax(S, dim=-1)                  # (N, N) 每行加起来等于 1
+    return P @ V                                  # (N, d)
+```
+
+## 第一笔账：计算量
+
+### attention 本身要算多少
+
+数一下 @eq-attention 里的两次矩阵乘法：
+
+- $S = QK^\top$：一共 $N \times N$ 个分数，每个是一次 $d$ 维点积，需要 $N^2 d$ 次乘加；
+- $O = PV$：一共 $N \times d$ 个输出，每个是对 $N$ 个数的加权求和，也需要 $N^2 d$ 次乘加。
+
+一个头合计 $2N^2 d$ 次乘加。$h$ 个头的维度加起来是 $D$，所以一层 attention 合计 $2N^2 D$ 次乘加。softmax 本身只需要 $O(N^2)$ 次运算，相比之下可以忽略。
+
+::: {.callout-note collapse="true"}
+## 细节：矩阵乘法的计算量怎么数
+一个 $(a \times b)$ 的矩阵乘以一个 $(b \times c)$ 的矩阵，结果有 $a \times c$ 个元素，每个元素是一个长度为 $b$ 的点积，需要 $b$ 次乘加，所以一共是 $a \cdot b \cdot c$ 次乘加。一次乘加通常记作 2 次浮点运算（FLOPs）。
+
+- $QK^\top$：$(N \times d)$ 乘 $(d \times N)$，需要 $N \cdot d \cdot N = N^2 d$ 次乘加；
+- $PV$：$(N \times N)$ 乘 $(N \times d)$，需要 $N \cdot N \cdot d = N^2 d$ 次乘加。
+:::
+
+### attention 是不是计算的大头？
+
+一层 Transformer 里，除了 attention，还有把 $X$ 投影成 $Q$、$K$、$V$ 的矩阵、输出投影矩阵，以及前馈网络（FFN）。这些部分的计算量和 $N$ 成正比：每个词要和这一层的每个参数做一次乘加，一层大约有 $12D^2$ 个参数，所以每个词大约需要 $12D^2$ 次乘加。而 attention 自身，每个词要做 $2ND$ 次乘加：先和 $N$ 个词打分，再对 $N$ 个 value 求加权平均。两者之比是
+
+$$
+\frac{2ND}{12D^2} = \frac{N}{6D}.
+$$ {#eq-ratio}
+
+也就是说，**序列长度超过 $6D$ 以后，attention 自身就成了计算的大头**。以隐藏维度 $D = 4096$ 的模型（比如 Llama-2-7B [@touvron2023llama2]）为例：
+
+| 序列长度 $N$ | attention 自身占一层计算的比例 |
+|---|---|
+| 2K | 约 8% |
+| 8K | 约 25% |
+| 32K | 约 57% |
+| 128K | 约 84% |
+
+: $D = 4096$ 时，attention 自身的计算占比 {#tbl-ratio}
+
+表中的占比按 @eq-ratio 计算。^[因果掩码下，有一半分数注定会被屏蔽，高效的实现可以直接跳过它们。这时 attention 的计算量大约减半，交叉点推迟到 $N \approx 12D$，但结论不变。]。
+
+所以，处理短文本时，attention 并不是最贵的部分；但它随 $N^2$ 增长，序列一长，就会迅速压过其余所有部分。而长上下文正是今天的趋势：读长文档、理解整个代码库、Agent 的多轮交互、长长的推理链，都需要模型一次处理几万甚至几十万个词。
+
+::: {.callout-note collapse="true"}
+## 细节：$12D^2$ 和 $2ND$ 是怎么来的
+**参数部分（每个词）：**
+
+- $W_Q$、$W_K$、$W_V$ 和输出投影 $W_O$：4 个 $D \times D$ 的矩阵，共 $4D^2$；
+- FFN：两个矩阵，分别是 $D \times 4D$ 和 $4D \times D$，共 $8D^2$。Llama 用的 SwiGLU 有三个大约 $D \times \frac{8}{3}D$ 的矩阵，总量同样约为 $8D^2$。
+
+合计约 $12D^2$。以 Llama-2-7B 为例，每层的参数量是 $4 \times 4096^2 + 3 \times 4096 \times 11008 \approx 2.02$ 亿，正好约等于 $12D^2$。
+
+**attention 部分（每个词）：** 每个头要和 $N$ 个 key 各做一次 $d$ 维点积，再对 $N$ 个 $d$ 维的 value 加权求和，共 $2Nd$ 次乘加。$h$ 个头合计 $2Nhd = 2ND$。
+:::
+
+## 第二笔账：存储量
+
+### 训练时：每一层都要留着 $N \times N$ 的矩阵
+
+在标准实现里，$S$ 和 $P$ 都是实实在在存放在 GPU 显存里的 $N \times N$ 矩阵。训练时更麻烦：反向传播求梯度要用到 $P$（比如 $V$ 的梯度就是 $P^\top$ 乘以输出的梯度），所以 $P$ 必须一直留到反向传播。而反向传播要等整个前向计算跑完才开始，于是**每一层、每一个头**的 $P$ 都要同时留在显存里。
+
+一个 $N \times N$ 的矩阵用 fp16（每个数 2 字节）存储：
+
+| 序列长度 $N$ | 一个头、一层的 $P$ |
+|---|---|
+| 1K | 2 MB |
+| 4K | 32 MB |
+| 32K | 2 GB |
+| 128K | 32 GB |
+
+: 一个 $N \times N$ 矩阵占用的显存（fp16） {#tbl-memory}
+
+只看一个头好像还能接受，但还要乘上头数和层数。以 Llama-2-7B 的结构（32 层，每层 32 个头）为例，$N = 4096$、batch 为 1 时，光是保存 $P$ 就需要 32 层 × 32 个头 × 32 MB = 32 GB，比模型权重本身（fp16 下约 13 GB）还大得多。Linear Attention 的论文也指出了这一点：softmax attention 的内存和计算量一样是 $O(N^2)$，因为求梯度时必须存下整个注意力矩阵 [@katharopoulos2020transformers]。
+
+### 推理时：越滚越大的 KV cache
+
+推理（也就是生成文字）是一个词一个词进行的。生成第 $t$ 个词时，它的 query 要和前面所有 $t-1$ 个词的 key、value 做 attention。前面那些词的 key 和 value 不会再变，每一步都重新算一遍太浪费，所以通常把它们存起来，这就是 **KV cache**。
+
+KV cache 的大小和已经处理的词数成正比。每个词要存 key 和 value 两份，每一层都要存，所以每个词占用 $2 \times L \times D \times 2$ 字节，其中 $L$ 是层数，最后的 2 是 fp16 每个数的字节数。
+
+Llama-2-7B 有 $L = 32$ 层，$D = 4096$，每个词要占 $2 \times 32 \times 4096 \times 2$ 字节 = 512 KB^[实际模型常用分组查询注意力（GQA）等技巧，让多个头共用同一份 key 和 value，把 KV cache 缩小好几倍，比如 Llama-2-70B [@touvron2023llama2]。但 KV cache 随 $N$ 线性增长这一点不会改变。]。Llama-2-7B 原生只支持 4K 的上下文，下表更长的部分只是按它的结构推算：
+
+| 上下文长度 $N$ | KV cache |
+|---|---|
+| 4K | 2 GB |
+| 32K | 16 GB |
+| 128K | 64 GB |
+
+: Llama-2-7B 结构下 KV cache 的大小（fp16，batch 为 1） {#tbl-kvcache}
+
+上下文到 128K 时，KV cache 大约是模型权重的 5 倍。而且每生成一个新词，都要和越来越多的旧词做 attention，越往后生成得越慢。
+
+## 小结：标准 attention 的三笔账
+
+| 代价 | 随 $N$ 怎么增长 | 例子（Llama-2-7B 结构，$N$ = 128K） |
+|---|---|---|
+| 计算量 | $N^2$ | attention 自身约占一层计算的 84% |
+| 训练时的中间矩阵 | $N^2$ | 一个头、一层就要 32 GB |
+| 推理时的 KV cache | $N$ | 64 GB，约为模型权重的 5 倍 |
+
+: 标准 attention 的代价 {#tbl-summary}
+
+接下来的两篇论文，分别从两个方向下手：
+
+- **FlashAttention** [@dao2022flashattention] 改「怎么算」：数学上一个字都不改，计算量也没有减少，但不再把 $N \times N$ 的矩阵写进显存。结果速度快了好几倍，显存也降了下来。
+- **Linear Attention** [@katharopoulos2020transformers] 改「算什么」：换一种计算相似度的方式，让计算量从 $N^2$ 降到 $N$；推理时用一个固定大小的状态，代替不断变大的 KV cache。
+
+FlashAttention 为什么能“不少算，却更快”？这涉及表里还没有列出的第四笔账：数据在 GPU 不同存储层级之间搬运的代价。下一节就从这笔账讲起。
+
+## FlashAttention：数学不变，改计算方式
+
+### 能不能不存中间矩阵？
+
+回顾上一节的三笔账：训练时的显存随 $N^2$ 增长，根源就是那张 $N \times N$ 的中间矩阵。下面还会看到，它连计算速度也一并拖慢了。于是一个很自然的问题是：
+
+> 能不能保持 softmax attention 不变，结果不使用近似方法，但计算时不把 $N \times N$ 的中间矩阵存下来，同时还算得更快？
+
+FlashAttention [@dao2022flashattention] 给出了这种方法的具体实现。它算的仍然是 @eq-attention，结果和标准实现一样（只差浮点数的舍入误差），改变的只是“怎么算”。要理解它为什么有效，先要了解一点 GPU 的硬件知识。
+
+### GPU 的两层存储：仓库与工作台
+
+GPU 上的数据主要放在两种存储里^[这里只讲和 attention 最相关的两层。实际上还有寄存器、L2 缓存，以及 CPU 内存等。]：
+
+- **HBM（高带宽显存）**：也就是平常说的“显存”。容量大，模型参数、输入输出和中间结果都放在这里。
+- **SRAM（片上缓存）**：在计算单元旁边，速度快得多，但容量非常小。
+
+| | HBM | SRAM |
+|---|---|---|
+| 容量 | 40–80 GB | 每个 SM 192 KB，108 个 SM 合计约 20 MB |
+| 带宽 | 1.5–2.0 TB/s | 约 19 TB/s |
+
+: A100 GPU 的两层存储，SM 是 GPU 里的流式多处理器（数据来自 @dao2022flashattention） {#tbl-gpu-memory}
+
+打个比方（@fig-memory）：HBM 像一个大仓库，什么都放得下，但离得远，搬一趟要花不少时间；SRAM 像手边的工作台，拿取极快，但只摆得下几样东西。GPU 做任何计算，都要先把数据从仓库搬到工作台，算完再搬回仓库。
+
+::: {#fig-memory}
+{{< include _fig-memory.qmd >}}
+
+GPU 的存储层级：计算单元只能直接处理工作台（SRAM）上的数据，而工作台和仓库（HBM）之间的搬运要慢一个数量级。
+:::
+
+所以一个操作花多少时间，取决于“算”和“搬”哪个更慢：
+
+- **计算密集**：每搬来一个数，都要参与很多次运算。比如大矩阵乘法，时间主要花在算上。
+- **访存密集**：每个数搬来只做一两次运算就搬回去。比如 softmax、mask、dropout 这类逐元素的操作，时间几乎全花在搬运上。
+
+而 GPU 的算力增长一直比显存带宽快，越来越多的操作卡在“搬”上，而不是“算”上 [@dao2022flashattention]。
+
+### 标准 attention 在 GPU 上怎么跑
+
+标准实现（论文中的算法 0）分三步，每一步都是一个独立的 GPU 程序（kernel），每一步的结果都要写回 HBM，下一步再读出来：
+
+| 步骤 | 从 HBM 读 | 写回 HBM |
+|---|---|---|
+| ① $S = QK^\top$ | $Q$、$K$ | $S$（$N \times N$） |
+| ② $P = \operatorname{softmax}(S)$ | $S$（$N \times N$） | $P$（$N \times N$） |
+| ③ $O = PV$ | $P$（$N \times N$）、$V$ | $O$ |
+
+: 标准 attention 的三步 {#tbl-standard-steps}
+
+$N \times N$ 的矩阵一共在 HBM 进出了 4 次。第 ② 步最典型：softmax 对每个数只做一次指数和一次除法，却要把 $N^2$ 个数从仓库搬来，再搬回去。训练时还有 mask、dropout 等逐元素操作，每多一步就多一次搬运。
+
+论文测量了 GPT-2 中 attention 的耗时：两次矩阵乘法只占一小部分，大部分时间花在 mask、softmax 和 dropout 上，也就是花在搬运上 [@dao2022flashattention]。这就是上一节结尾说的**第四笔账：数据搬运**。
+
+于是 FlashAttention 的目标就很明确了：**让 $N \times N$ 的矩阵根本不进仓库**，只在工作台上一小块一小块地出现，算完就用，用完就丢。这要解决两个问题：
+
+1. **前向**：softmax 需要整行的信息（最大值和总和），可工作台放不下一整行，怎么分块算？
+2. **反向**：反向传播要用到 $P$，不存它怎么办？
+
+这两个问题分别对应 FlashAttention 的两个核心思路。
+
+### 思路一：分块计算，边算边修正
+
+#### 先看一行
+
+还是用 @fig-pairs 里的 4 个词，只看“苹果”这一行。假设它和 4 个词的分数是 $[1, 3, 2, 5]$（为了好算，省略除以 $\sqrt{d}$），4 个词的 value 用一维的数 $10, 20, 30, 40$ 代替。
+
+先回忆 softmax 的一个实现细节：为了避免数值溢出，实际计算时会先给每个分数减去这一行的最大值，再取指数^[fp16 能表示的最大数约为 65504，而 $e^{12} \approx 16$ 万，分数稍大一点就会溢出。分子分母同时乘上 $e^{-m}$，结果不变，但所有指数都不超过 0。]。
+
+**一次看完整行（标准做法）：**
+
+- 最大值 $m = 5$；
+- 指数：$e^{1-5}, e^{3-5}, e^{2-5}, e^{5-5} \approx 0.018, 0.135, 0.050, 1$；
+- 总和：$\ell \approx 0.018 + 0.135 + 0.050 + 1 = 1.203$；
+- 加权和：$A \approx 0.018 \times 10 + 0.135 \times 20 + 0.050 \times 30 + 1 \times 40 = 44.38$；
+- 输出：$o = A / \ell \approx 36.9$。
+
+**分两块算（工作台一次只放得下 2 个词的 key 和 value）：**
+
+- **块 1**，分数 $[1, 3]$：
+  - 块内最大值 $m = 3$；
+  - 指数：$e^{1-3}, e^{3-3} \approx 0.135, 1$；
+  - 总和 $\ell \approx 1.135$，加权和 $A \approx 0.135 \times 10 + 1 \times 20 = 21.35$。
+- **块 2**，分数 $[2, 5]$：
+  - 最大值从 3 变成了 5。块 1 的结果都是以 3 为基准算的，要换成以 5 为基准，只需统一乘上修正系数 $e^{3-5} \approx 0.135$；
+  - 总和：$\ell \approx 0.135 \times 1.135 + (e^{2-5} + e^{5-5}) \approx 0.153 + 1.050 = 1.203$；
+  - 加权和：$A \approx 0.135 \times 21.35 + (0.050 \times 30 + 1 \times 40) \approx 2.88 + 41.50 = 44.38$。
+- **最后**：$o = A / \ell \approx 36.9$，和一次看完整行的结果完全一样。
+
+修正系数为什么是对的？块 1 算的是 $e^{x-3}$，我们真正想要的是 $e^{x-5}$，两者只差一个常数因子：$e^{x-5} = e^{x-3} \cdot e^{3-5}$。所以把块 1 留下的总和与加权和整体乘上 $e^{3-5}$，就相当于把基准从 3 换成了 5。
+
+关键在于：**整个过程只需要记住三个数：当前的最大值 $m$、总和 $\ell$ 和加权和 $A$**。新的一块进来时，用这三个数就能更新结果，不需要回头去看前面块的原始数据。不管一行有多长，都可以这样切成小块依次处理。这个技巧叫作在线 softmax（online softmax）[@milakov2018online]。
+
+#### 再看整张表
+
+把视角从一行放大到整张 $4 \times 4$ 的分数表（@fig-tiling）。$Q$、$K$、$V$ 都按每块 2 个词切开，分数表就被切成 4 个 $2 \times 2$ 的小块。论文的算法 1 按下面的顺序遍历：
+
+- **外层循环**：依次把一块 $K_j$、$V_j$ 从 HBM 读进 SRAM；
+- **内层循环**：对每一块 $Q_i$，把它和这一块目前的结果（$O_i$，以及每行的 $m$、$\ell$）读进 SRAM，算出 $2 \times 2$ 的分数块 $S_{ij}$，用上面的方法更新结果，再写回 HBM。
+
+::: {#fig-tiling}
+{{< include _fig-tiling.qmd >}}
+
+FlashAttention 的分块计算。左：$4 \times 4$ 的分数表被切成 4 个 $2 \times 2$ 的块，按 1、2、3、4 的顺序计算（外层按 key、value 的块，内层按 query 的块）。右：第 1 步时，工作台上只有前两个词的数据和一个 $2 \times 2$ 的分数块；仓库里自始至终没有 $N \times N$ 的矩阵。
+:::
+
+对任意一行来说，它都是先遇到左边那一块，再遇到右边那一块，这正是上面“先看块 1、再看块 2”的过程。分数块 $S_{ij}$ 和对应的概率只在 SRAM 里存在过，用完就丢。HBM 里自始至终只有 $Q$、$K$、$V$、$O$ 和每行的两个数 $m$、$\ell$，**没有任何 $N \times N$ 的矩阵**。
+
+而且，所有这些步骤被合并（fuse）进了**一个** GPU 程序：读进来的数据在 SRAM 里一口气完成乘法、softmax、mask、dropout 和第二次乘法，不再像标准实现那样分成好几个程序，每一步都往返一趟 HBM。
+
+::: {.callout-note collapse="true"}
+## 细节：算法 1 的更新公式与循环顺序
+算法 1 第 12 行的更新公式是
+
+$$
+O_i \leftarrow \operatorname{diag}(\ell_i^{\text{new}})^{-1}\left(\operatorname{diag}(\ell_i)\, e^{m_i - m_i^{\text{new}}} O_i + e^{\tilde{m}_{ij} - m_i^{\text{new}}} \tilde{P}_{ij} V_j\right).
+$$
+
+这里的 $\operatorname{diag}(\ell_i)$ 是把向量 $\ell_i$ 放到对角线上的对角矩阵，左乘它的效果是“每一行乘以这一行自己的数”。所以这个公式说的就是上面一行例子里的四步：乘回旧的总和，把基准换成新的最大值，加上新块的贡献，再除以新的总和。之所以要先乘回旧的总和，是因为论文在 HBM 里存的是已经除过总和的 $O_i$。
+
+**循环顺序**：论文外层遍历 key、value 的块，所以每一轮都要把 $O_i$ 从 HBM 读出来、更新、再写回去。FlashAttention-2 [@dao2024flashattention2] 把顺序反了过来，外层遍历 query 的块：$O_i$ 一直留在 SRAM 里，所有块都处理完才写一次 HBM，而且不同的 query 块可以分给不同的计算单元同时算。两种顺序在数学上完全一样。后面如果有继续更新会把这一点再与大家做一个详细的分享。
+:::
+
+::: {.callout-tip collapse="true"}
+## 代码：20 行实现分块前向，并和标准实现对比
+为了好读，这里按 FlashAttention-2 的顺序写（外层遍历 query 的块）。真正的 FlashAttention 是用 CUDA 写的，这段 Python 代码只用来说明计算逻辑：它从不构造完整的 $N \times N$ 矩阵，分数块最大只有 `block × block`。
+
+```python
+import torch
+
+def flash_attention_forward(Q, K, V, block=2):
+    """分块计算 softmax(Q K^T / sqrt(d)) V"""
+    N, d = Q.shape
+    O = torch.empty_like(Q)
+    for i in range(0, N, block):                        # 一块 query
+        q = Q[i:i + block] / d**0.5
+        m = torch.full((q.shape[0], 1), float("-inf"))  # 每行当前的最大值
+        l = torch.zeros(q.shape[0], 1)                  # 每行当前的总和
+        A = torch.zeros(q.shape[0], d)                  # 每行当前的加权和
+        for j in range(0, N, block):                    # 一块 key、value
+            s = q @ K[j:j + block].T                    # 只有 block × block 大小
+            m_new = torch.maximum(m, s.max(dim=1, keepdim=True).values)
+            scale = torch.exp(m - m_new)                # 旧结果的修正系数
+            p = torch.exp(s - m_new)
+            l = scale * l + p.sum(dim=1, keepdim=True)
+            A = scale * A + p @ V[j:j + block]
+            m = m_new
+        O[i:i + block] = A / l
+    return O
+
+Q, K, V = torch.randn(3, 8, 4).unbind(0)                # N = 8, d = 4
+reference = torch.softmax(Q @ K.T / 4**0.5, dim=-1) @ V
+print(torch.allclose(flash_attention_forward(Q, K, V), reference, atol=1e-6))  # True
+```
+:::
+
+### 思路二：反向时重算，而不是存储
+
+前向不存 $P$ 了，可训练时反向传播要用到它（上一节说过，$V$ 的梯度就是 $P^\top$ 乘以输出的梯度）。FlashAttention 的办法是：前向时额外存下每一行的最大值 $m$ 和总和 $\ell$，每行只有 2 个数，一共 $2N$ 个，而不是 $N^2$ 个。反向时需要哪一块 $P$，就用 $Q$、$K$ 重新算出那一块的分数，再用存好的 $m$、$\ell$ 直接得到精确的概率：
+
+$$
+P_{ij} = \frac{e^{S_{ij} - m_i}}{\ell_i}.
+$$
+
+和前向不同，这时每一行最终的 $m$、$\ell$ 已经知道了，每一块都能一步算出精确结果，不需要再边算边修正。还是用“苹果”这一行验证：前向存下的是 $m = 5$、$\ell \approx 1.203$。反向时重算块 1，分数是 $[1, 3]$，概率就是 $e^{1-5} / 1.203 \approx 0.015$ 和 $e^{3-5} / 1.203 \approx 0.112$，和直接对整行做 softmax 的结果一样^[dropout 的掩码也是 $N \times N$ 的。FlashAttention 不存它，而是存下随机数生成器的状态，反向时重新生成同样的掩码。]。
+
+重算意味着要多做计算：反向时要再算一遍 $QK^\top$。但这些计算都在快速的 SRAM 上完成，换来的是不用把 $N \times N$ 的 $P$ 写进 HBM 再读出来。论文在 GPT-2 medium 上的测量很能说明问题：
+
+| | 标准 attention | FlashAttention |
+|---|---|---|
+| 计算量（GFLOPs） | 66.6 | 75.2 |
+| HBM 读写量（GB） | 40.3 | 4.4 |
+| 运行时间（ms） | 41.7 | 7.3 |
+
+: 前向加反向的开销，GPT-2 medium（序列长度 1024，头维度 64，16 个头，batch 64），A100 [@dao2022flashattention] {#tbl-flash-cost}
+
+计算量多了约 13%，HBM 读写量却少了约 9 倍，结果快了约 5.7 倍。对 attention 来说，真正的瓶颈是搬运，而不是计算。
+
+### 为什么既快又省显存
+
+把两个思路放在一起，和标准实现对比（这里的结果均为原文章中推导得到的结论）：
+
+| | 标准实现 | FlashAttention |
+|---|---|---|
+| 计算量 | $O(N^2 d)$ | $O(N^2 d)$，反向多算一次 $QK^\top$ |
+| HBM 读写量 | $O(N^2 + Nd)$ | $O(N^2 d^2 / M)$ |
+| 额外显存 | $O(N^2)$ | $O(N)$ |
+
+: 标准实现与 FlashAttention，$M$ 是 SRAM 能放下的数的个数 {#tbl-flash-compare}
+
+- **省显存**：不存任何 $N \times N$ 的矩阵，额外只存每行的 $m$、$\ell$，所以从 $N^2$ 降到 $N$。
+- **省搬运**：标准实现要把 $N \times N$ 的矩阵搬进搬出好几趟。FlashAttention 不搬它，代价是要把 $Q$ 和 $O$ 多读几遍。只要头维度 $d$ 的平方比 SRAM 的容量 $M$ 小得多，后者就少得多。
+- **更快**：attention 的瓶颈在搬运上，搬运少了，速度就上来了。
+
+::: {.callout-note collapse="true"}
+## 细节：读写量 $N^2 d^2 / M$ 是怎么来的
+注意 $M$ 按“能放下多少个数”计算，而不是字节数。论文估计 A100 上可用的 SRAM 约为 100 KB，fp16 下约为 5 万个数。
+
+1. SRAM 要同时放下 $K_j$、$V_j$、$Q_i$、$O_i$ 四种块，所以一块最多 $M / (4d)$ 行；
+2. $K$、$V$ 因此被切成 $N / (M / 4d) = 4Nd / M$ 块；
+3. 每处理一块 $K_j$、$V_j$，都要把整个 $Q$ 和 $O$ 扫一遍，每遍搬运 $O(Nd)$ 个数；
+4. 合计 $O(Nd) \times O(Nd / M) = O(N^2 d^2 / M)$。
+
+和标准实现的 $N^2$ 相比，两者之比约为 $d^2 / M$。$d = 64$ 时，$d^2 = 4096$，比 $M$ 小 12 倍左右；$d = 128$ 时只小 3 倍左右，所以论文发现头维度越大，加速越少。
+:::
+
+### 实验结果
+
+论文用 FlashAttention 替换了几个主流模型里的 attention：
+
+- **训练更快**：BERT-large 的训练比 MLPerf 1.1 的速度纪录快 15%（17.4 分钟对 20.0 分钟，8 张 A100）；GPT-2 的训练比 HuggingFace 的实现快约 3 倍，比 Megatron-LM 快约 1.7 倍。
+- **结果不变**：GPT-2 用两种实现训练，验证集困惑度的曲线几乎完全重合。这正是“精确”的意思：它没有用任何近似。
+- **显存更省**：序列长度 4K 时，attention 的显存比 PyTorch 标准实现少约 20 倍（836 MB 对 17,024 MB），而且随长度线性增长，一直能跑到 64K。
+- **能处理更长的序列**：GPT-2 的上下文从 1K 加到 4K，训练仍比 Megatron-LM 的 1K 版本快 30%，困惑度从 18.2 降到 17.5。在需要 16K 长度的 Path-X 任务上，第一次有 Transformer 做到好于随机猜测（61.4%）。
+
+关于推理要说清楚一点：FlashAttention 加速的是前向计算，所以推理时一次性处理长输入的阶段（prefill）同样受益；但逐词生成的阶段每一步只有一个新的 query，瓶颈在于读取越来越大的 KV cache，FlashAttention 第一版对此帮助有限。后来的 Flash-Decoding [@dao2023flashdecoding] 专门针对这个阶段做了优化（之后有时间再与大家分享这个具体的优化）。
+
+### 它没有解决什么
+
+FlashAttention 让标准 attention 在不改变结果的前提下快了好几倍，也省下了 $N^2$ 的显存。但它没有改变 attention 本身：
+
+- **计算量还是 $N^2$**：序列再长下去，即使搬运已经很省，算力终究也会成为瓶颈；
+- **推理时的 KV cache 照样随 $N$ 增长**：每生成一个新词，都要把所有旧词的 key 和 value 读一遍。
+
+要从根本上摆脱 $N^2$，就得改「算什么」。这就是下一节的 Linear Attention。
+
+## Linear Attention：改「算什么」
+
+### 引子：从 Qwen3.5 说起
+
+我开始调研 linear attention，是因为 Qwen3.5 的 MoE 模型用了一种 3:1 的混合结构：每 4 层里，3 层用的是一种改进版的 linear attention（Gated DeltaNet），只有 1 层是标准的 attention^[准确地说是 Gated Attention：在标准 softmax attention 的输出上再乘一个门控，计算量仍随 $N^2$ 增长。以 Qwen3.5-397B-A17B 为例，60 层正好是 15 组“3 层 Gated DeltaNet + 1 层 Gated Attention”，见[官方模型卡](https://huggingface.co/Qwen/Qwen3.5-397B-A17B)。]。我很好奇：linear attention 到底有什么特别之处，能让它承担大部分的层？于是我从这个方向最经典的一篇论文 [@katharopoulos2020transformers] 读起。读下来才发现，它正是为了解决本文讨论的问题而提出的：让 attention 的计算量不再随 $N^2$ 增长。
+
+下面我们就沿着论文的思路走一遍。
+
+### 第一步：把 softmax 看成一种相似度
+
+把 @eq-attention 的第 $i$ 行单独写出来（为了简洁，省略了 $1/\sqrt{d}$，它可以并进 $q_i$ 里）：
+
+$$
+o_i = \frac{\sum_{j} \exp(q_i^\top k_j)\, v_j}{\sum_{j} \exp(q_i^\top k_j)}.
+$$
+
+这其实就是一个加权平均：权重由第 $i$ 个词的 query 和每个词的 key 的相似度决定，softmax 用的相似度是 $\exp(q^\top k)$。论文把它推广成任意的相似度函数 $\operatorname{sim}(q, k)$：
+
+$$
+o_i = \frac{\sum_{j} \operatorname{sim}(q_i, k_j)\, v_j}{\sum_{j} \operatorname{sim}(q_i, k_j)}.
+$$ {#eq-general-attention}
+
+取 $\operatorname{sim}(q, k) = \exp(q^\top k)$，就回到了标准的 softmax attention。
+
+### 第二步：拆掉 softmax，用上结合律
+
+现在假设相似度能写成两个向量的点积：$\operatorname{sim}(q, k) = \phi(q)^\top \phi(k)$，其中 $\phi$ 是一个把向量变成另一个向量的函数（它从哪来，后面再讲）。代入 @eq-general-attention 的分子：
+
+$$
+\sum_{j} \big(\phi(q_i)^\top \phi(k_j)\big)\, v_j^\top
+= \phi(q_i)^\top \underbrace{\sum_{j} \phi(k_j)\, v_j^\top}_{S}.
+$$
+
+关键的一步是：$\phi(q_i)$ 和求和的下标 $j$ 无关，可以提到求和号外面。剩下的 $S = \sum_j \phi(k_j) v_j^\top$ 和第几个 query 无关，**只需要算一次，所有 query 共用**。分母也一样：$\sum_j \phi(q_i)^\top \phi(k_j) = \phi(q_i)^\top z$，其中 $z = \sum_j \phi(k_j)$。
+
+写成矩阵，就是调换了乘法的顺序：
+
+$$
+\big(\phi(Q)\, \phi(K)^\top\big)\, V = \phi(Q)\, \big(\phi(K)^\top V\big).
+$$ {#eq-assoc}
+
+矩阵乘法的结合律保证两边的结果完全相同，但计算量天差地别（@fig-assoc）：左边先算出 $N \times N$ 的矩阵，右边先算出的 $\phi(K)^\top V$ 只有 $d \times d$ 大小。
+
+::: {#fig-assoc}
+{{< include _fig-assoc.qmd >}}
+
+同一个结果的两种计算顺序。顺序一的中间结果是 $N \times N$ 的矩阵，随序列长度平方增长；顺序二的中间结果只有 $d \times d$，和序列长度无关。
+:::
+
+| | 顺序一：先算 $\phi(Q)\phi(K)^\top$ | 顺序二：先算 $\phi(K)^\top V$ |
+|---|---|---|
+| 中间结果 | $N \times N$ | $d \times d$ |
+| 计算量（乘加次数） | $2N^2 d$ | $2Nd^2$ |
+
+: 两种计算顺序的对比（设 $\phi$ 不改变向量的维度） {#tbl-assoc}
+
+两者的计算量之比是 $N/d$。以 $N = 4096$、$d = 64$ 为例，顺序二的计算量只有顺序一的 1/64。序列越长，省得越多：计算量从随 $N^2$ 增长，变成了随 $N$ 线性增长。
+
+### 动手算一个例子
+
+沿用前文“动手算一个小例子”里的 $Q$、$K$、$V$，$\phi$ 用论文选的 $\phi(x) = \operatorname{elu}(x) + 1$（后面会解释为什么选它）。它对非负的数就是加 1，所以 0 变成 1，1 变成 2：
+
+$$
+\phi(Q) = \begin{bmatrix} 2 & 1 \\ 1 & 2 \\ 2 & 2 \end{bmatrix}, \quad
+\phi(K) = \begin{bmatrix} 2 & 2 \\ 1 & 2 \\ 2 & 1 \end{bmatrix}, \quad
+V = \begin{bmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{bmatrix}.
+$$
+
+**顺序一**：先算 $3 \times 3$ 的相似度矩阵
+
+$$
+\phi(Q)\, \phi(K)^\top = \begin{bmatrix} 6 & 4 & 5 \\ 6 & 5 & 4 \\ 8 & 6 & 6 \end{bmatrix}.
+$$
+
+第 1 行的和是 15，归一化后乘 $V$，第 1 个词的输出是 $\frac{1}{15}\big(6 \times (1, 0) + 4 \times (0, 1) + 5 \times (1, 1)\big) = \big(\frac{11}{15}, \frac{9}{15}\big)$。
+
+**顺序二**：先算 $2 \times 2$ 的 $S$ 和 2 维的 $z$：
+
+$$
+S = \phi(K)^\top V = \begin{bmatrix} 4 & 3 \\ 3 & 3 \end{bmatrix}, \qquad z = \sum_j \phi(k_j) = (5, 5).
+$$
+
+第 1 个词的 $\phi(q_1) = (2, 1)$。分子是 $\phi(q_1)^\top S = (2 \times 4 + 1 \times 3,\ 2 \times 3 + 1 \times 3) = (11, 9)$，分母是 $\phi(q_1)^\top z = 2 \times 5 + 1 \times 5 = 15$，输出同样是 $\big(\frac{11}{15}, \frac{9}{15}\big)$。
+
+两种顺序的结果一样，不同的是，顺序二从头到尾没有出现 $3 \times 3$ 的矩阵。$S$ 的大小只取决于维度 $d$：序列再长，它也只是 $2 \times 2$。
+
+### 为什么 softmax 不能这样做：核函数的视角
+
+上面的推导只用了一个前提：相似度能拆成 $\phi(q)^\top \phi(k)$。softmax 的 $\exp(q^\top k)$ 为什么不行？这要借助核函数来理解，这也是论文把 $\phi$ 称为“核的特征表示”（kernel feature map）的原因。把 attention 看成核函数的思路，来自更早的 @tsai2019transformer。
+
+**核函数是什么。** 核函数 $\kappa(x, y) = \phi(x)^\top \phi(y)$：先用 $\phi$ 把两个向量映射到另一个空间（通常维度更高），再在那里做点积。举个例子，取 $x = (1, 2)$、$y = (3, 1)$，二阶多项式核 $\kappa(x, y) = (x^\top y)^2$：
+
+- **直接算**：$x^\top y = 1 \times 3 + 2 \times 1 = 5$，平方得 25；
+- **经过特征空间算**：取 $\phi(x) = (x_1^2, \sqrt{2}\, x_1 x_2, x_2^2)$，得到 $\phi(x) = (1, 2\sqrt{2}, 4)$、$\phi(y) = (9, 3\sqrt{2}, 1)$，点积是 $9 + 12 + 4 = 25$。
+
+两种算法的结果一样。在支持向量机（SVM）里，核函数的妙处是只用第一种算法，不必真的把 $\phi$ 构造出来。特征空间的维度很高、甚至无穷维时，这是唯一可行的办法。
+
+**linear attention 用核的方向正好相反**：它**必须**把 $\phi$ 显式地算出来。因为只有拿到 $\phi(q)$ 和 $\phi(k)$ 这两半，才能把 $\phi(q_i)$ 提到求和号外面。
+
+**exp 核对应无穷维。** $\exp(q^\top k)$ 本身也是一个核，但它对应的 $\phi$ 是无穷维的：
+
+$$
+\exp(q^\top k) = 1 + q^\top k + \frac{(q^\top k)^2}{2!} + \frac{(q^\top k)^3}{3!} + \cdots
+$$
+
+展开式的每一项都对应一组特征（一阶、二阶、三阶……），永远写不完。所以 softmax attention 只能对每一对 $(q, k)$ 直接计算 $\exp(q^\top k)$，这恰好是 SVM 那种用法，代价是必须把 $N^2$ 对全部算一遍。
+
+换成矩阵的说法：exp 是逐个元素作用在 $QK^\top$ 上的，$\exp(QK^\top)$ 没法写成两个有限大小的矩阵相乘，自然也就没法先算 $K^\top V$。注意，问题不在结合律：结合律对任何矩阵乘法都成立，只是 softmax 里根本凑不出三个可以调换顺序的矩阵。
+
+### 为什么叫 linear attention
+
+名字里的 linear，首先指计算量随序列长度**线性**增长，也就是从 $O(N^2)$ 降到了 $O(N)$。它之所以能做到线性，是因为把相似度换成了 $\phi(q)^\top \phi(k)$ 这种点积，论文称之为把 attention “线性化”（§3.2 的标题就是 Linearized Attention），从而可以用上矩阵乘法的结合律。
+
+后来的文献里，linear 还多了一层意思：下文会看到，它的状态是按线性的方式递推更新的，没有普通 RNN 里的非线性激活函数，所以也被称为线性 RNN [@yang2024gated]。
+
+### 论文选的 $\phi$：elu + 1
+
+有了核的视角，设计 linear attention 就变成了选择 $\phi$。论文用的是
+
+$$
+\phi(x) = \operatorname{elu}(x) + 1 =
+\begin{cases}
+x + 1, & x > 0, \\
+e^{x}, & x \le 0,
+\end{cases}
+$$ {#eq-elu}
+
+逐个元素作用，输出和输入一样是 $d$ 维。elu 是指数线性单元 [@clevert2016fast]。
+
+**为什么必须是正数。** 论文保留了 softmax 的分母，也就是 @eq-general-attention 里的归一化。如果相似度有正有负，分母就可能接近 0，甚至变号。比如两个词的相似度分别是 1.0 和 −0.99，分母只有 0.01，权重就变成了 100 和 −99，输出会爆炸，梯度也会变得极大。elu + 1 的每个分量都大于 0，两个这样的向量做点积一定是正数，分母就是安全的^[论文还提到，不用 relu 是因为 relu 在负半轴的梯度恒为 0。]。这也是不能直接用原始的 $q$、$k$ 做点积的原因：$q^\top k$ 可正可负。
+
+**优点：**
+
+- **计算便宜**：只是逐个元素的运算，不增加维度，状态 $S$ 只有 $d \times d$；
+- **数值安全**：相似度恒为正，归一化不会出问题。
+
+**代价：**
+
+- **它不是 exp 的近似**：elu + 1 定义的是另一个有限维的核，所以 linear attention 是一个新的模型，而不是“更快地算 softmax”。
+- **注意力不够集中**：exp 能把相关和不相关的词的权重拉开巨大的差距，而 elu + 1 在正半轴只是线性增长，权重容易被“摊平”。
+- **记忆容量有限**：所有历史信息都要压进 $d \times d$ 的 $S$ 里，词一多就会互相干扰（后文再展开）。论文的语音识别实验里已经能看到差距：linear attention 的音素错误率是 8.08%，softmax 是 5.12%。
+
+### 因果版本：一边读，一边累加
+
+语言模型要加因果掩码：第 $i$ 个词只能看到前 $i$ 个词。这时第 $i$ 个词需要的不再是所有词共用的 $S$，而是它自己的“前缀和”：
+
+$$
+S_i = \sum_{j \le i} \phi(k_j)\, v_j^\top, \qquad
+z_i = \sum_{j \le i} \phi(k_j), \qquad
+o_i = \frac{\phi(q_i)^\top S_i}{\phi(q_i)^\top z_i}.
+$$ {#eq-causal-linear}
+
+如果每个位置都从头求一遍和，计算量又回到了 $N^2$。但相邻两个前缀和只差一项：
+
+$$
+S_i = S_{i-1} + \phi(k_i)\, v_i^\top, \qquad z_i = z_{i-1} + \phi(k_i).
+$$ {#eq-recurrence}
+
+从左到右扫一遍，每来一个词，就把它的 $\phi(k_i) v_i^\top$ 加进 $S$。每一步的代价都是 $O(d^2)$，和已经处理了多少个词无关，总计算量是 $O(Nd^2)$。
+
+接着上面的例子，这次加上因果掩码：
+
+- **第 1 个词**：$S_1 = \phi(k_1) v_1^\top = \begin{bmatrix} 2 & 0 \\ 2 & 0 \end{bmatrix}$，$z_1 = (2, 2)$；
+- **第 2 个词**：$S_2 = S_1 + \phi(k_2) v_2^\top = \begin{bmatrix} 2 & 1 \\ 2 & 2 \end{bmatrix}$，$z_2 = (3, 4)$；
+- **第 3 个词**：$S_3 = S_2 + \phi(k_3) v_3^\top = \begin{bmatrix} 4 & 3 \\ 3 & 3 \end{bmatrix}$，$z_3 = (5, 5)$。
+
+以第 2 个词为例，$\phi(q_2) = (1, 2)$，输出是 $\phi(q_2)^\top S_2 / \phi(q_2)^\top z_2 = (6, 5) / 11$，和在相似度矩阵的第 2 行里屏蔽掉第 3 个词、再归一化的结果一样。最后的 $S_3$ 也正是前面不加掩码时的 $S$：最后一个词本来就能看到所有词。
+
+### 这其实就是一个 RNN
+
+换个角度看 @eq-recurrence，它就是一个循环神经网络：
+
+- **状态**是 $S$（以及 $z$），大小固定为 $d \times d$，不随序列变长；
+- 每读入一个词，就用 $\phi(k_i) v_i^\top$ 更新一次状态；
+- 输出由 $\phi(q_i)$ 去“读取”状态得到。
+
+这就是论文标题 “Transformers are RNNs” 的由来。它顺带解决了第二笔账里的推理问题：
+
+- **不再需要 KV cache**：标准 attention 要存下所有旧词的 key 和 value，linear attention 只需要存一个 $d \times d$ 的 $S$ 和一个 $d$ 维的 $z$；
+- **每生成一个词的代价恒定**：不会越往后生成越慢。
+
+同时，它又保留了 Transformer 训练时可以并行的优点。状态更新里只有加法，没有非线性函数，所以训练时整个序列已知，所有位置的前缀和可以用并行算法一次算出，不必像传统 RNN 那样一步一步地等^[论文自己的实现是按时间顺序累加的；后来的 GLA [@yang2024gated] 等工作发展出了分块并行的高效算法（关于高效的并行算法后面如果有调研到会与大家分享）。]。
+
+::: {.callout-tip collapse="true"}
+## 代码：两种计算顺序，以及 RNN 形式
+下面的代码分别实现了不加掩码的 linear attention（顺序二）和加了因果掩码的递推形式（@eq-recurrence），并和直接算出 $N \times N$ 相似度矩阵的结果对比。
+
+```python
+import torch
+import torch.nn.functional as F
+
+def phi(x):
+    return F.elu(x) + 1
+
+def linear_attention(Q, K, V):
+    """不加掩码：先算 φ(K)^T V，所有 query 共用"""
+    Qf, Kf = phi(Q), phi(K)
+    S = Kf.T @ V                                  # (d, d)，和 N 无关
+    z = Kf.sum(dim=0)                             # (d,)
+    return (Qf @ S) / (Qf @ z)[:, None]
+
+def causal_linear_attention(Q, K, V):
+    """因果版本：从左到右累加状态 S 和 z，就像一个 RNN"""
+    Qf, Kf = phi(Q), phi(K)
+    S = torch.zeros(Q.shape[1], V.shape[1])
+    z = torch.zeros(Q.shape[1])
+    out = []
+    for i in range(Q.shape[0]):
+        S = S + torch.outer(Kf[i], V[i])          # S_i = S_{i-1} + φ(k_i) v_i^T
+        z = z + Kf[i]
+        out.append(Qf[i] @ S / (Qf[i] @ z))
+    return torch.stack(out)
+
+Q, K, V = torch.randn(3, 6, 4).unbind(0)          # N = 6, d = 4
+sim = phi(Q) @ phi(K).T                           # (N, N) 相似度矩阵，仅用于对比
+print(torch.allclose(linear_attention(Q, K, V), (sim / sim.sum(1, keepdim=True)) @ V, atol=1e-6))
+masked = sim.tril()                               # 屏蔽右上三角
+print(torch.allclose(causal_linear_attention(Q, K, V), (masked / masked.sum(1, keepdim=True)) @ V, atol=1e-6))
+```
+:::
+
+### 反向传播：同样是一边扫，一边累加
+
+训练还需要反向传播。如果把 @eq-recurrence 直接交给自动求导，它会把每一步的 $S_i$ 都存下来留给反向用：一共 $N$ 个 $d \times d$ 的矩阵，显存是 $O(Nd^2)$，大约是输入输出本身的 $d$ 倍。
+
+论文推导出，梯度本身也能写成同样的累加形式（论文的式 13–15，这里统一写成列向量）。记归一化之前的输出，也就是 @eq-causal-linear 里的分子，为 $\bar{v}_i = S_i^\top \phi(q_i)$，$g_i$ 是损失对它的梯度，则
+
+$$
+\nabla_{\phi(q_i)} \mathcal{L} = S_i\, g_i, \qquad
+\nabla_{\phi(k_i)} \mathcal{L} = R_i\, v_i, \qquad
+\nabla_{v_i} \mathcal{L} = R_i^\top \phi(k_i),
+$$ {#eq-linear-grad}
+
+其中
+
+$$
+S_i = \sum_{j \le i} \phi(k_j)\, v_j^\top, \qquad
+R_i = \sum_{j \ge i} \phi(q_j)\, g_j^\top.
+$$
+
+从这组公式可以读出两点：
+
+- $S_i$ 就是前向的前缀和，从前往后累加；
+- $R_i$ 是一个“后缀和”，从后往前累加：$R_i = R_{i+1} + \phi(q_i)\, g_i^\top$。它和前向的形式完全对称，只是方向相反，就像 RNN 的反向传播要沿着时间倒着走。
+
+所以反向传播也不需要存下所有的 $S_i$：先从前往后扫一遍，一边累加 $S_i$，一边算 $q$ 的梯度；再从后往前扫一遍，一边累加 $R_i$，一边算 $k$ 和 $v$ 的梯度。每一步只维护一个 $d \times d$ 的累加矩阵，时间是 $O(Nd^2)$，额外的显存降到 $O(Nd)$（论文的算法 1）。
+
+还要补充一点：输出由分子和分母相除得到，分子 $\bar{v}_i = S_i^\top \phi(q_i)$ 要用到 $d \times d$ 的状态，分母 $\phi(q_i)^\top z_i$ 只用到 $d$ 维的 $z_i$。上面的公式只处理了分子这一路。分母这一路不需要特别处理：自动求导只需存下每一步的 $z_i$，一共 $N \times d$ 个数，和 $\phi(K)$ 本身一样大，不会有显存问题（@tbl-num-den）。所以实现时，分子用论文推导的累加公式手写反向传播，分母照常交给自动求导，两路的梯度最后按链式法则自动相加。
+
+| | 分子这一路 | 分母这一路 |
+|---|---|---|
+| 公式 | $\bar{v}_i = S_i^\top \phi(q_i)$ | $\phi(q_i)^\top z_i$ |
+| 用到的累加量 | $S_i$：$d \times d$ 的矩阵 | $z_i$：$d$ 维的向量 |
+| 自动求导要存下的量 | $N$ 个 $d \times d$ 矩阵，共 $Nd^2$ 个数 | $N$ 个 $d$ 维向量，共 $Nd$ 个数 |
+| $N = 4096$、$d = 64$ 时 | 约 1678 万个数（fp16 约 32 MB） | 约 26 万个数（fp16 约 0.5 MB） |
+| 处理方式 | 按 @eq-linear-grad 手写反向传播 | 直接交给自动求导 |
+
+: 反向传播时，分子和分母两路要存的中间结果（一个头、一层） {#tbl-num-den}
+
+也就是说，“维护一个固定大小的状态，一边扫一边累加”这个形式，在前向和反向里都成立。后来的各种改进，基本都是在这个骨架上改“怎么更新状态”。
+
+### 实验结果
+
+论文在几类任务上，把 linear attention 和标准的 softmax attention 做了对比：
+
+- **复制任务**：一个人工构造的任务，模型要把一串符号原样复制一遍，序列最长 128。linear attention 能正常收敛，最终的损失和 softmax 持平。
+- **速度和显存**：linear attention 的时间和显存都随序列长度线性增长。在 11 GB 显存的 GTX 1080 Ti 上，softmax 最长只能跑到 4096，linear attention 能一直跑到 65536。
+- **图像生成**：逐个像素地生成图片。质量和 softmax 接近：MNIST 上的 bits/dim（越低越好）是 0.644，softmax 是 0.621。生成速度则快得多：MNIST 上快 317 倍，CIFAR-10 上快 4462 倍。
+- **语音识别**：每个 epoch 的训练时间只有 softmax 的三分之一左右（824 秒对 2711 秒），但音素错误率是 8.08%，softmax 是 5.12%，差距明显。
+
+::: {.callout-warning}
+## “快 4000 倍”的前提
+- **比较的对象**：论文的 softmax 基线没有用 KV cache，每生成一个像素，都要把前面所有像素重算一遍。和带 KV cache 的版本相比，linear attention 只快约 19 倍（MNIST）和 56 倍（CIFAR-10）。
+- **比的是吞吐量**：linear attention 的显存恒定，可以一次同时生成大量图片（MNIST 上一次生成 1 万张）。batch 为 1 时，在 GPU 上生成一张 CIFAR-10 图片，只比带 KV cache 的 softmax 快约 1.14 倍。
+- **CIFAR-10 的质量**：linear attention 的 3.40 比 softmax 的 3.47 还好，是因为同样训练 7 天，它多跑了约 3 倍的 epoch；按 epoch 对齐来比，softmax 仍然更好。
+:::
+
+所以，效率上的收益是真的，但质量上的差距也已经露头。差距从哪来？要回到前面埋下的那个伏笔：所有历史信息，都要压进一个固定大小的 $S$ 里。
+
+### 代价：有限的记忆
+
+把 @eq-recurrence 里的状态 $S$ 看成一个存储器：
+
+- **写入**：每来一个词，就执行 $S \mathrel{+}= \phi(k)\, v^\top$，把这个词的 value 按它的 key 存进去；
+- **读取**：用 $\phi(q)^\top S$ 去查。query 和哪个 key 越像，就读出越多那个 key 对应的 value。
+
+为了看清读出来的是什么，下面先忽略分母，$\phi$ 取恒等映射（直接用原始的 key），并把三个 value 设成独热向量：$v_1 = (1, 0, 0)$、$v_2 = (0, 1, 0)$、$v_3 = (0, 0, 1)$。这样读出结果的三个分量，就分别表示“读到了多少 $v_1$、$v_2$、$v_3$”。
+
+**先存两个互相垂直的 key**：$k_1 = (1, 0)$，$k_2 = (0, 1)$。
+
+$$
+S = k_1 v_1^\top + k_2 v_2^\top = \begin{bmatrix} 1 & 0 & 0 \\ 0 & 1 & 0 \end{bmatrix}.
+$$
+
+用 $k_1$ 去读，$k_1^\top S$ 正好取出第 1 行 $(1, 0, 0)$，就是 $v_1$；用 $k_2$ 去读，取出的是 $v_2$。完全准确。
+
+**再存第三个 key**：$k_3 = (0.707, 0.707)$，它指向 45° 方向，长度为 1。
+
+$$
+S = \begin{bmatrix} 1 & 0 & 0.707 \\ 0 & 1 & 0.707 \end{bmatrix}.
+$$
+
+再用 $k_1$ 去读，得到的是 $(1, 0, 0.707) = v_1 + 0.707\, v_3$。本来只想要 $v_1$，却混进了 0.707 份 $v_3$，这就是**串扰**（@fig-crosstalk）。
+
+::: {#fig-crosstalk}
+{{< include _fig-crosstalk.qmd >}}
+
+2 维的 key 最多只有 2 个互相垂直的方向。第 3 个 key（橙色）和前两个都不垂直，用任何一个 key 去读，都会混进别的 value。
+:::
+
+把读取展开，就能看出串扰从哪来：
+
+$$
+k_1^\top S = \sum_{j} (k_1^\top k_j)\, v_j^\top.
+$$
+
+每个 $v_j$ 前面的系数，就是 $k_1$ 和 $k_j$ 的点积。$k_1$ 和 $k_2$ 垂直，系数是 0；$k_1$ 和 $k_3$ 夹角 45°，系数是 $\cos 45° \approx 0.707$。**只要两个 key 不垂直，读其中一个，就会把另一个也带出来。**
+
+而 2 维平面里最多只有 2 个互相垂直的方向，第 3 个 key 不管放在哪里，都不可能和前两个都垂直。推广开来：**$d$ 维的 key，最多只能让 $d$ 条信息互不干扰**。论文用的 elu + 1 不改变维度，同样受这个限制。可是语言模型的 $S$ 要装下整个上下文，$N$ 往往是 $d$ 的成百上千倍（比如 $d = 128$、$N = 32$K），串扰不可避免^[这种“把 linear attention 看成存储器、容量受维度限制”的分析来自 @schlag2021linear，它把 linear attention 和 1990 年代的快速权重（fast weight）联系了起来。]。
+
+打个比方：$S$ 就像一个只有 $d$ 个抽屉的柜子，每个 key 决定东西放进哪些抽屉、各放多少。$k_1$ 和 $k_2$ 各占一个抽屉；$k_3$ 没有自己的抽屉，只能拆开放进两个抽屉。之后谁打开第一个抽屉，都会顺带拿到一部分 $v_3$。
+
+这正是 softmax 做得到、linear attention 做不到的事。softmax 不把历史压缩成固定大小的状态，而是保留所有的 key（也就是 KV cache），再借助 exp 把最匹配的那个 key 的权重放大到压倒一切，所以能从成千上万个词里精确地找回其中一个。linear attention 用固定大小的状态，换来了恒定的推理代价，代价就是记忆有上限。
+
+**升维可以缓解，但有代价。** 串扰的大小等于两个 key 的点积。如果先用 $\phi$ 把 key 映射到更高维的空间，不同的 key 在新空间里就能离得更“开”。比如二阶多项式 $\phi(x) = (x_1^2, \sqrt{2}\, x_1 x_2, x_2^2)$ 把 2 维的 key 映射到 3 维，单位长度的 key 之间的点积就从 $\cos\theta$ 变成了 $\cos^2\theta$：
+
+| $\phi$ | 特征维度 | 用 $k_1$ 读时混进的 $v_3$ |
+|---|---|---|
+| 恒等映射（原始的 key） | 2 | 0.707 |
+| 二阶多项式 | 3 | 0.5 |
+| 四阶多项式 | 5 | 0.25 |
+
+: 升维可以减少串扰（$k_1$ 和 $k_3$ 夹角 45°） {#tbl-crosstalk}
+
+阶数越高，不同的 key 越接近垂直，串扰越小。但代价是状态 $S$ 变成 $C \times d$（$C$ 是 $\phi$ 的输出维度），计算量变成 $O(NCd)$，而 $C$ 随阶数飞快地增长：$d = 64$ 时，二阶多项式的 $C$ 就是 4096（去掉重复项后是 2080），状态比原来大几十倍。softmax 的 exp 核相当于无穷维，串扰可以压到几乎为 0，所以它能精确检索，代价是回到了 $N^2$。
+
+**偶数阶还有一个副作用：相反也算相似。** 平方会抹掉符号：$\cos 135° = -0.707$，平方后是 $+0.5$，和 45° 的 key 一样。更极端的情况是 $\phi(k) = \phi(-k)$：一个和 query 完全相反的 key，会和完全匹配的 key 拿到同样的权重。取 $q = (1, 0)$，比较三个 key 的权重（已归一化）：
+
+| key | $q^\top k$ | softmax：$e^{q^\top k}$ | 二阶多项式：$(q^\top k)^2$ | Taylor：$1 + q^\top k + \frac{1}{2}(q^\top k)^2$ |
+|---|---|---|---|---|
+| 匹配 $(1, 0)$ | 1 | 0.665 | 0.5 | 0.625 |
+| 垂直 $(0, 1)$ | 0 | 0.245 | 0 | 0.25 |
+| 相反 $(-1, 0)$ | −1 | 0.090 | 0.5 | 0.125 |
+
+: 平方核把“相反”当成了“相似”（$q = (1, 0)$） {#tbl-sign}
+
+softmax 的权重随点积单调增加：越对齐越大，越相反越小。@zhang2024hedgehog 把这种**单调性**列为 softmax 的关键性质之一。平方核破坏了它：想让模型“别看”某个词，softmax 只要让这个词的 key 背对 query 就行，平方核却要求 key 恰好和 query 垂直，可选的范围窄得多。
+
+补救的办法是在平方项之外保留低阶项。Based [@arora2024simple] 用的核 $1 + q^\top k + \frac{1}{2}(q^\top k)^2$ 正是 $\exp(q^\top k)$ 的二阶 Taylor 展开（特征维度 $1 + d + d^2$）。它恒为正（最小值是 $q^\top k = -1$ 时的 0.5），在 $q^\top k > -1$ 的范围内单调增加，上表中的权重已经和 softmax 相当接近。不过它只在点积不太负的时候像 exp：$q^\top k = -2$ 时它等于 1，而 $e^{-2} \approx 0.14$。@zhang2024hedgehog 也指出，Taylor 展开只在点积有界的范围内保持单调。
+
+### 选 $\phi$ 的几条规则
+
+把前面的讨论合起来，可以总结出设计 $\phi$ 时要兼顾的几条：
+
+1. **非负**：只要保留了分母，相似度就必须为正（前文讨论过）。
+2. **单调**：query 和 key 越对齐，权重应该越大；越相反，权重应该越小（@tbl-sign）。
+3. **维度决定容量**：$\phi$ 的输出维度 $C$ 决定了状态 $S$ 的大小，也就决定了最多能干净地存下多少条信息。
+4. **区分度**：好的 $\phi$ 应该让不相关的 key 在特征空间里尽量接近垂直，注意力才“尖”，串扰才小。
+5. **本身要便宜**：$C$ 越大，状态越大，计算量 $O(NCd)$ 也越大，不能把省下来的时间又吃回去。
+
+后三条互相拉扯：记得越多，就算得越慢。@arora2024simple 把这称为“回忆能力和吞吐量之间的权衡”（recall–throughput tradeoff）。论文选的 elu + 1 站在“算得快”的一端：它满足非负，计算也便宜，但不升维，所以容量也最小。
+
+### 回到 Qwen3.5：后来的路
+
+沿着这些规则，后来的工作大致分成了两条路。
+
+**第一条路：换一个更好的 $\phi$。** 比如用随机特征去逼近 exp 核的 Performer [@choromanski2021rethinking]，用 exp 的二阶 Taylor 展开当作特征的 Based [@arora2024simple]，以及让 $\phi$ 自己学着模仿 softmax 的 Hedgehog [@zhang2024hedgehog]。它们都在“升维”和“区分度”上下功夫。
+
+**第二条路成了今天的主流：不扩容，改“怎么写入”。** 原始的 linear attention 只会往 $S$ 里不停地加，从不删除，旧信息越积越多，互相干扰。于是后来的模型从两个方向改造了更新规则：
+
+- **加入遗忘**：每一步先让 $S$ 衰减一点，$S_t = \alpha_t S_{t-1} + \phi(k_t)\, v_t^\top$（$0 < \alpha_t < 1$，可以是固定的常数，也可以由输入决定），让旧信息逐渐淡出，给新信息腾出地方。RetNet [@sun2023retentive]、GLA [@yang2024gated] 和 Mamba-2 [@dao2024transformers] 都属于这一类。
+- **先擦后写**：写入一个 key 之前，先读出 $S$ 里这个 key 对应的旧内容，再用新的 value 把它替换掉，这就是 delta rule [@schlag2021linear]。
+
+Qwen3.5 用的 Gated DeltaNet [@yang2025gated] 把这两者结合在了一起：门控负责遗忘，delta rule 负责精确地改写。
+
+**那为什么还要保留四分之一的标准 attention？** 通常的解释是：无论更新规则怎么改，固定大小的状态总会遗忘。需要精确检索的时候，比如从一篇长文里原样找回某一句话，还得靠能看到全部历史的标准 attention。混合结构让大部分层用便宜的 linear attention 处理信息，再用少数几层标准 attention 负责精确的“查找”。
+
+## 参考文献
+
+::: {#refs}
+:::

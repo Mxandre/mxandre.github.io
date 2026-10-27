@@ -2,6 +2,18 @@
 title: "关于"
 ---
 
-这里记录工程 + 理论视角的技术调研：每篇讲清一个主题的来龙去脉、核心原理和工程实现。
+这里是我的技术调研笔记。我会把学习和工作中遇到的、让我好奇的问题记录下来，并把围绕它们展开的调研过程分享出来。
 
-目前以中文为主，之后会补英文版。
+每篇文章会尽量写清楚三件事：
+
+- **起点**：我为什么会关心这个问题；
+- **过程**：读了哪些论文，卡在了哪里，又是怎么想通的；
+- **收获**：最后理解了什么，还有哪些没想明白。
+
+视角上兼顾理论和工程：既讲清一个主题的来龙去脉和核心原理，也关心它在硬件上怎么才能跑得快。
+
+文章目前以中文为主。如果你发现错误，或者想聊聊某个问题，欢迎在文章底部的评论区留言，或者到 [GitHub Discussions](https://github.com/Mxandre/mxandre.github.io/discussions) 交流。
+
+---
+
+These are my research notes on technical questions I run into in study and work. Each post walks through why I cared about a question, how I researched it, and what I learned. Posts are mainly in Chinese. Comments and corrections are very welcome, either under a post or in [GitHub Discussions](https://github.com/Mxandre/mxandre.github.io/discussions).

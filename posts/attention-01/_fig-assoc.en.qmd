@@ -1,0 +1,41 @@
+```{=html}
+<svg viewBox="0 0 680 340" width="100%" role="img" aria-labelledby="fig-assoc-title" style="display:block; max-width:680px; margin:0 auto;">
+<title id="fig-assoc-title">Two orders for the same result: an N×N or a d×d intermediate</title>
+<g fill="currentColor" font-size="16" font-weight="bold">
+<text x="40" y="28">Order 1: compute φ(Q)φ(K)ᵀ first</text>
+<text x="40" y="196">Order 2: compute φ(K)ᵀV first</text>
+</g>
+<g fill="currentColor" fill-opacity="0.08" stroke="currentColor" stroke-opacity="0.5" stroke-width="1">
+<rect x="40" y="44" width="24" height="96"/>
+<rect x="108" y="80" width="96" height="24"/>
+<rect x="40" y="246" width="96" height="24"/>
+<rect x="178" y="210" width="24" height="96"/>
+</g>
+<g fill="#EF9F27" fill-opacity="0.25" stroke="#EF9F27" stroke-width="1.4">
+<rect x="248" y="44" width="96" height="96"/>
+<rect x="246" y="246" width="24" height="24"/>
+</g>
+<g fill="currentColor" font-size="20" text-anchor="middle" dominant-baseline="central">
+<text x="86" y="92">×</text>
+<text x="226" y="92">=</text>
+<text x="156" y="258">×</text>
+<text x="224" y="258">=</text>
+</g>
+<g fill="currentColor" font-size="16" dominant-baseline="central">
+<text x="296" y="92" text-anchor="middle">N × N</text>
+<text x="280" y="258">d × d</text>
+</g>
+<g fill="currentColor" font-size="15" text-anchor="middle">
+<text x="52" y="160">φ(Q)</text>
+<text x="156" y="124">φ(K)ᵀ</text>
+<text x="88" y="290">φ(K)ᵀ</text>
+<text x="190" y="324">V</text>
+</g>
+<g fill="currentColor" fill-opacity="0.75" font-size="15">
+<text x="372" y="84">then multiply by V</text>
+<text x="372" y="110">intermediate grows as N²</text>
+<text x="372" y="250">then multiply φ(Q) by it</text>
+<text x="372" y="276">intermediate size independent of N</text>
+</g>
+</svg>
+```

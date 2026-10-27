@@ -1,0 +1,27 @@
+```{=html}
+<svg viewBox="0 0 680 250" width="100%" role="img" aria-labelledby="fig-crosstalk-title" style="display:block; max-width:680px; margin:0 auto;">
+<title id="fig-crosstalk-title">2 维空间里存 3 个 key：第 3 个 key 和前两个都不垂直，读取时产生串扰</title>
+<defs>
+<marker id="fc-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+<marker id="fc-arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#EF9F27" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+</defs>
+<path d="M120 210H300M120 210V40" fill="none" stroke="currentColor" stroke-opacity="0.3" stroke-width="1"/>
+<line x1="120" y1="210" x2="258" y2="210" stroke="currentColor" stroke-width="2" marker-end="url(#fc-arrow)"/>
+<line x1="120" y1="210" x2="120" y2="72" stroke="currentColor" stroke-width="2" marker-end="url(#fc-arrow)"/>
+<line x1="120" y1="210" x2="217" y2="113" stroke="#EF9F27" stroke-width="2" marker-end="url(#fc-arrow-amber)"/>
+<path d="M160 210A40 40 0 0 0 148.3 181.7" fill="none" stroke="currentColor" stroke-opacity="0.6" stroke-width="1"/>
+<g fill="currentColor" font-size="15">
+<text x="166" y="202" font-size="14">45°</text>
+<text x="258" y="236" text-anchor="middle">k₁ = (1, 0)</text>
+<text x="130" y="66">k₂ = (0, 1)</text>
+<text x="224" y="106">k₃ = (0.707, 0.707)</text>
+</g>
+<text x="420" y="56" fill="currentColor" font-size="16" font-weight="bold">分别用三个 key 去读：</text>
+<g fill="currentColor" font-size="16">
+<text x="420" y="96">k₁ → v₁ + <tspan fill="#EF9F27" font-weight="bold">0.707 v₃</tspan></text>
+<text x="420" y="132">k₂ → v₂ + <tspan fill="#EF9F27" font-weight="bold">0.707 v₃</tspan></text>
+<text x="420" y="168">k₃ → <tspan fill="#EF9F27" font-weight="bold">0.707 v₁ + 0.707 v₂</tspan> + v₃</text>
+</g>
+<text x="420" y="204" fill="currentColor" fill-opacity="0.75" font-size="14">橙色的部分就是串扰</text>
+</svg>
+```

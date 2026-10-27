@@ -1,0 +1,29 @@
+```{=html}
+<svg viewBox="0 0 680 236" width="100%" role="img" aria-labelledby="fig-memory-title" style="display:block; max-width:680px; margin:0 auto;">
+<title id="fig-memory-title">GPU memory hierarchy: compute units, the SRAM workbench and the HBM warehouse</title>
+<defs>
+<marker id="fm-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+</defs>
+<g fill="currentColor" fill-opacity="0.06" stroke="currentColor" stroke-opacity="0.45" stroke-width="1">
+<rect x="40" y="70" width="120" height="60" rx="8"/>
+<rect x="500" y="40" width="140" height="120" rx="8"/>
+</g>
+<rect x="230" y="70" width="160" height="60" rx="8" fill="#EF9F27" fill-opacity="0.2" stroke="#EF9F27" stroke-width="1.2"/>
+<g fill="currentColor" font-size="15" font-weight="bold" text-anchor="middle" dominant-baseline="central">
+<text x="100" y="100">Compute units</text>
+<text x="310" y="100">SRAM workbench</text>
+<text x="570" y="100">HBM warehouse</text>
+</g>
+<line x1="164" y1="100" x2="226" y2="100" stroke="currentColor" stroke-width="2" marker-start="url(#fm-arrow)" marker-end="url(#fm-arrow)"/>
+<line x1="394" y1="100" x2="496" y2="100" stroke="currentColor" stroke-width="1" stroke-dasharray="4 4" marker-start="url(#fm-arrow)" marker-end="url(#fm-arrow)"/>
+<g fill="currentColor" fill-opacity="0.75" font-size="15" text-anchor="middle">
+<text x="195" y="86">fast</text>
+<text x="445" y="86">~10× slower</text>
+<text x="100" y="190">multiply, add</text>
+<text x="310" y="190">~20 MB, ~19 TB/s</text>
+<text x="310" y="214">(only 192 KB per SM)</text>
+<text x="570" y="190">40–80 GB, 1.5–2.0 TB/s</text>
+<text x="570" y="214">weights, data, buffers</text>
+</g>
+</svg>
+```

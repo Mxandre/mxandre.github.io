@@ -1,0 +1,869 @@
+---
+title: "Making Attention Faster (1): Linear Attention and FlashAttention"
+subtitle: "Two ideas: change *what* we compute, or *how* we compute it"
+date: "2026-10-26"
+categories: [attention, linear-attention, flash-attention]
+bibliography: references.bib
+lang: en
+toc-title: "Contents"
+comments:
+  giscus:
+    repo: Mxandre/mxandre.github.io
+    language: en
+---
+
+::: {.callout-note}
+中文版：[阅读中文版](index.qmd)
+
+This is part of an ongoing series on attention; it is updated as my research progresses. Part 1 is complete.
+
+Some of the follow-up work mentioned here (such as Performer, Based and Gated DeltaNet) is only introduced briefly; I haven't studied it in depth yet and will add more once I do. If you find anything wrong or inaccurate, please point it out in the comments at the end. Discussion is very welcome.
+:::
+
+The Transformer is the foundation of almost every large model today, and its core component, attention, has one well-known problem: its cost grows with the square of the sequence length. This series tries to explain the solutions that have appeared so far. Part 1 introduces the ideas behind two of them:
+
+- **FlashAttention** (2022) [@dao2022flashattention]: changes *how* we compute. The math stays exactly the same; only the way the computation is organized changes, and both speed and memory improve dramatically.
+- **Linear Attention** (2020) [@katharopoulos2020transformers]: changes *what* we compute. It uses a different way of measuring similarity, so the amount of computation drops from quadratic to linear.
+
+Before getting to either method, we first need to understand: what exactly makes standard attention expensive?
+
+::: {.callout-tip}
+## How to read this post
+The main text tries to explain each idea with intuition and small examples. Derivations are tucked into collapsible boxes; feel free to skip them on a first read.
+:::
+
+## From RNNs to Transformers
+
+Before the Transformer, the workhorse for sequence data such as text was the recurrent neural network (RNN), for example the LSTM [@hochreiter1997long]. An RNN reads a sentence much like a person does: one word at a time. Each new word is merged with the "memory" so far (the hidden state), the memory is updated, and then it moves on to the next word.
+
+This approach has two serious weaknesses:
+
+- **Slow training**: step $t$ cannot start until step $t-1$ has finished, so the words of a sentence are processed in a queue and the parallelism of the GPU goes largely unused.
+- **Distant information fades**: information from word 1 has to be passed along step by step to reach word 1000, and it keeps getting diluted by new information along the way.
+
+In 2017, the Transformer [@vaswani2017attention] removed recurrence entirely and modeled the relationships between words with attention alone^[The attention mechanism itself is older: @bahdanau2015neural used it in an RNN-based translation model to align source and target sentences. What was new in the Transformer was dropping recurrence completely and relying on attention alone.]. With attention, every word can **directly** see every other word in the sequence, with no step-by-step relaying; and all words can be computed at the same time, so training makes full use of the GPU. These two advantages let the Transformer scale to unprecedented sizes: GPT, BERT and nearly every large language model today are built on it.
+
+But "every word looks at every word" is not free: $N$ words have to interact pairwise, so the cost grows as $N^2$ (@fig-pairs). Let's work out exactly what that costs.
+
+::: {#fig-pairs}
+{{< include _fig-pairs.en.qmd >}}
+
+Attention scores every word against every word. Left: 4 words paired up give 16 lines; the highlighted lines show "fish" looking at all words. Right: each line is one cell of the score matrix. Bottom: each time the number of words $N$ doubles, the number of cells grows 4×.
+:::
+
+## What attention computes
+
+### Intuition: queries, keys and values
+
+Attention gives every word three vectors:
+
+- **query**: what kind of information am I looking for?
+- **key**: what kind of information do I have? Think of it as a label.
+- **value**: what my information actually is.
+
+Picture looking something up in a library: the query is your search term, the keys are the titles and tags of the books, and the values are the books' contents. You compare your search term with every book's tags, read more of the more relevant books, and finally combine what you've read in proportion to relevance.
+
+In terms of computation, every word does three things:
+
+1. **Score**: take the dot product of its query with every word's key; a larger dot product means more relevant.
+2. **Normalize**: turn these scores into weights that sum to 1 with a softmax.
+3. **Average**: take the weighted average of all words' values as its output.
+
+### As formulas
+
+Suppose the input has $N$ words, each a $D$-dimensional vector, stacked into a matrix $X \in \mathbb{R}^{N \times D}$. Three learnable matrices first project it into queries, keys and values:
+
+$$
+Q = XW_Q, \quad K = XW_K, \quad V = XW_V, \qquad Q, K, V \in \mathbb{R}^{N \times d}.
+$$
+
+The output of attention is
+
+$$
+S = \frac{QK^\top}{\sqrt{d}}, \qquad P = \operatorname{softmax}(S), \qquad O = PV.
+$$ {#eq-attention}
+
+- $S \in \mathbb{R}^{N \times N}$ is the **score matrix**: $S_{ij}$ says how well the query of word $i$ matches the key of word $j$.
+- The softmax is applied to **each row** of $S$ separately. Row $i$ becomes the weights that word $i$ assigns to all words; together they form $P$.
+- $O \in \mathbb{R}^{N \times d}$ is the output; row $i$ is the average of all values weighted by row $i$ of $P$.
+
+Dividing by $\sqrt{d}$ keeps the dot products from getting too large^[The larger $d$ is, the larger the dot products tend to be, and the softmax becomes too "sharp": almost all the weight lands on one word and the gradients become tiny. Dividing by $\sqrt{d}$ brings the values back to a reasonable range [@vaswani2017attention].].
+
+Two more details are always used in practice:
+
+- **Causal mask**: language models like GPT generate text left to right, so word $i$ may only see itself and the words before it, never "peek" at later ones. Before the softmax, the entries of $S$ with $j > i$ (the upper-right triangle) are set to $-\infty$, which makes their weights 0.
+- **Multi-head attention**: in practice the $D$ dimensions are split into $h$ parts of $d = D/h$ dimensions each, and attention runs independently on each part (each one is a "head"); the results are then concatenated. Different heads can attend to different kinds of relationships.
+
+### A small worked example
+
+Take 3 words with $d = 2$. To keep the arithmetic easy, we skip the division by $\sqrt{d}$ and use no causal mask:
+
+$$
+Q = \begin{bmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{bmatrix}, \quad
+K = \begin{bmatrix} 1 & 1 \\ 0 & 1 \\ 1 & 0 \end{bmatrix}, \quad
+V = \begin{bmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{bmatrix}.
+$$
+
+**Step 1, scores.** Row $i$, column $j$ of $S = QK^\top$ is the dot product of query $i$ and key $j$. For example, the query of word 3 is $(1, 1)$, and its dot product with key 1, $(1, 1)$, is $1 \times 1 + 1 \times 1 = 2$. All together:
+
+$$
+S = \begin{bmatrix} 1 & 0 & 1 \\ 1 & 1 & 0 \\ 2 & 1 & 1 \end{bmatrix}.
+$$
+
+**Step 2, softmax.** Exponentiate each row and divide by the row sum. For row 3: $e^2 \approx 7.39$ and $e^1 \approx 2.72$; the sum is $7.39 + 2.72 + 2.72 = 12.83$, so the weights are $7.39 / 12.83 \approx 0.58$ and $2.72 / 12.83 \approx 0.21$. All three rows:
+
+$$
+P = \begin{bmatrix} 0.42 & 0.16 & 0.42 \\ 0.42 & 0.42 & 0.16 \\ 0.58 & 0.21 & 0.21 \end{bmatrix}.
+$$
+
+**Step 3, weighted average.** The output of word 3 is $0.58 \times (1, 0) + 0.21 \times (0, 1) + 0.21 \times (1, 1) = (0.79, 0.42)$. All three rows:
+
+$$
+O = PV = \begin{bmatrix} 0.84 & 0.58 \\ 0.58 & 0.58 \\ 0.79 & 0.42 \end{bmatrix}.
+$$
+
+**Notice the shapes of $S$ and $P$.** 3 words produce $3 \times 3 = 9$ scores, because every pair of words is scored once (one line in @fig-pairs is one cell of the matrix). $N$ words produce $N \times N$ scores:
+
+| Sequence length $N$ | Number of scores $N^2$ |
+|---|---|
+| 3 | 9 |
+| 1K (1,024) | about 1.05 million |
+| 4K (4,096) | about 16.8 million |
+| 128K (131,072) | about 17.2 billion |
+
+: The score matrix grows with the square of the sequence length {#tbl-n2}
+
+This $N \times N$ score table is the root of all the trouble that follows.
+
+In PyTorch it takes only a few lines:
+
+```python
+import torch
+
+def standard_attention(Q, K, V, causal=True):
+    """Q, K, V: (N, d)"""
+    N, d = Q.shape
+    S = Q @ K.T / d**0.5                          # (N, N) score matrix
+    if causal:                                    # mask the upper-right triangle, i.e. "future" words
+        future = torch.triu(torch.ones(N, N, dtype=torch.bool, device=Q.device), diagonal=1)
+        S = S.masked_fill(future, float("-inf"))
+    P = torch.softmax(S, dim=-1)                  # (N, N) each row sums to 1
+    return P @ V                                  # (N, d)
+```
+
+## Cost 1: computation
+
+### How much attention itself computes
+
+Count the two matrix multiplications in @eq-attention:
+
+- $S = QK^\top$: $N \times N$ scores, each a $d$-dimensional dot product, so $N^2 d$ multiply-adds;
+- $O = PV$: $N \times d$ outputs, each a weighted sum of $N$ numbers, also $N^2 d$ multiply-adds.
+
+That is $2N^2 d$ multiply-adds per head. The dimensions of the $h$ heads add up to $D$, so one attention layer needs $2N^2 D$ multiply-adds in total. The softmax itself needs only $O(N^2)$ operations, which is negligible by comparison.
+
+::: {.callout-note collapse="true"}
+## Detail: counting the cost of a matrix multiplication
+Multiplying an $(a \times b)$ matrix by a $(b \times c)$ matrix gives $a \times c$ entries, each a dot product of length $b$ that needs $b$ multiply-adds, so $a \cdot b \cdot c$ multiply-adds in total. One multiply-add is usually counted as 2 floating-point operations (FLOPs).
+
+- $QK^\top$: $(N \times d)$ times $(d \times N)$ needs $N \cdot d \cdot N = N^2 d$ multiply-adds;
+- $PV$: $(N \times N)$ times $(N \times d)$ needs $N \cdot N \cdot d = N^2 d$ multiply-adds.
+:::
+
+### Is attention the main cost?
+
+Besides attention, a Transformer layer has the matrices that project $X$ into $Q$, $K$ and $V$, the output projection, and the feed-forward network (FFN). Their cost is proportional to $N$: every word does one multiply-add with every parameter of the layer, and a layer has about $12D^2$ parameters, so each word needs about $12D^2$ multiply-adds. Attention itself needs $2ND$ multiply-adds per word: scoring against $N$ words, then averaging $N$ values. The ratio of the two is
+
+$$
+\frac{2ND}{12D^2} = \frac{N}{6D}.
+$$ {#eq-ratio}
+
+In other words, **once the sequence is longer than $6D$, attention itself becomes the main cost**. Take a model with hidden size $D = 4096$ (such as Llama-2-7B [@touvron2023llama2]):
+
+| Sequence length $N$ | Share of the layer's compute spent in attention |
+|---|---|
+| 2K | about 8% |
+| 8K | about 25% |
+| 32K | about 57% |
+| 128K | about 84% |
+
+: Share of compute spent in attention itself, for $D = 4096$ {#tbl-ratio}
+
+The shares follow from @eq-ratio: the share is $N / (N + 6D)$^[With a causal mask, half of the scores are always masked out, and efficient implementations can skip them. Attention's cost then roughly halves and the crossover moves to $N \approx 12D$, but the conclusion is the same.].
+
+So for short texts, attention is not the most expensive part; but it grows as $N^2$, and for long sequences it quickly overtakes everything else. Long context is exactly where things are heading: reading long documents, understanding whole codebases, multi-turn agent interactions and long reasoning chains all require models to process tens or even hundreds of thousands of words at once.
+
+::: {.callout-note collapse="true"}
+## Detail: where $12D^2$ and $2ND$ come from
+**Parameters (per word):**
+
+- $W_Q$, $W_K$, $W_V$ and the output projection $W_O$: four $D \times D$ matrices, $4D^2$ in total;
+- FFN: two matrices of size $D \times 4D$ and $4D \times D$, $8D^2$ in total. The SwiGLU used in Llama has three matrices of roughly $D \times \frac{8}{3}D$, also about $8D^2$ in total.
+
+That adds up to about $12D^2$. For Llama-2-7B, each layer has $4 \times 4096^2 + 3 \times 4096 \times 11008 \approx 202$ million parameters, very close to $12D^2$.
+
+**Attention (per word):** each head takes a $d$-dimensional dot product with each of the $N$ keys, then a weighted sum of $N$ $d$-dimensional values, $2Nd$ multiply-adds in total. Over $h$ heads that is $2Nhd = 2ND$.
+:::
+
+## Cost 2: memory
+
+### Training: every layer keeps an $N \times N$ matrix
+
+In the standard implementation, $S$ and $P$ are real $N \times N$ matrices stored in GPU memory. Training makes it worse: the backward pass needs $P$ to compute gradients (for example, the gradient of $V$ is $P^\top$ times the gradient of the output), so $P$ must be kept until the backward pass. And the backward pass only starts after the whole forward pass has finished, so the $P$ of **every layer and every head** has to sit in memory at the same time.
+
+One $N \times N$ matrix stored in fp16 (2 bytes per number) takes:
+
+| Sequence length $N$ | $P$ for one head, one layer |
+|---|---|
+| 1K | 2 MB |
+| 4K | 32 MB |
+| 32K | 2 GB |
+| 128K | 32 GB |
+
+: Memory taken by one $N \times N$ matrix (fp16) {#tbl-memory}
+
+One head may look manageable, but it has to be multiplied by the number of heads and layers. With the Llama-2-7B architecture (32 layers, 32 heads per layer), at $N = 4096$ and batch size 1, storing $P$ alone takes 32 layers × 32 heads × 32 MB = 32 GB, far more than the model weights themselves (about 13 GB in fp16). The Linear Attention paper makes the same point: softmax attention's memory, like its computation, is $O(N^2)$, because the whole attention matrix must be stored to compute gradients [@katharopoulos2020transformers].
+
+### Inference: the ever-growing KV cache
+
+Inference (generating text) happens one word at a time. To generate word $t$, its query has to attend to the keys and values of all $t-1$ previous words. Those keys and values never change, and recomputing them at every step would be wasteful, so they are usually stored. This is the **KV cache**.
+
+The KV cache grows in proportion to the number of words processed so far. Each word stores a key and a value in every layer, so each word takes $2 \times L \times D \times 2$ bytes, where $L$ is the number of layers and the last 2 is the number of bytes per fp16 number.
+
+Llama-2-7B has $L = 32$ layers and $D = 4096$, so each word takes $2 \times 32 \times 4096 \times 2$ bytes = 512 KB^[Real models often use tricks such as grouped-query attention (GQA), where several heads share the same keys and values, to shrink the KV cache several times; Llama-2-70B is one example [@touvron2023llama2]. But the KV cache still grows linearly with $N$.]. Llama-2-7B natively supports only 4K tokens of context; the longer rows of the table below are extrapolated from its architecture:
+
+| Context length $N$ | KV cache |
+|---|---|
+| 4K | 2 GB |
+| 32K | 16 GB |
+| 128K | 64 GB |
+
+: KV cache size for the Llama-2-7B architecture (fp16, batch size 1) {#tbl-kvcache}
+
+At 128K tokens, the KV cache is about 5 times the size of the model weights. And every new word has to attend to more and more old words, so generation keeps slowing down.
+
+## Summary: the three costs of standard attention
+
+| Cost | How it grows with $N$ | Example (Llama-2-7B architecture, $N$ = 128K) |
+|---|---|---|
+| Computation | $N^2$ | attention itself is about 84% of a layer's compute |
+| Intermediate matrices in training | $N^2$ | 32 GB for one head in one layer |
+| KV cache at inference | $N$ | 64 GB, about 5 times the model weights |
+
+: The costs of standard attention {#tbl-summary}
+
+The two papers covered next attack these costs from two directions:
+
+- **FlashAttention** [@dao2022flashattention] changes *how* we compute: not a single symbol of the math changes and the computation is not reduced, but the $N \times N$ matrix is never written to GPU memory. The result is several times faster and uses much less memory.
+- **Linear Attention** [@katharopoulos2020transformers] changes *what* we compute: it measures similarity differently so that computation drops from $N^2$ to $N$, and at inference a fixed-size state replaces the ever-growing KV cache.
+
+How can FlashAttention be faster without computing less? The answer lies in a fourth cost not listed in the table: the cost of moving data between the levels of GPU memory. That is where the next section starts.
+
+## FlashAttention: same math, different computation
+
+### Can we avoid storing the intermediate matrix?
+
+Recall the three costs from the previous section: training memory grows as $N^2$, and the root cause is that $N \times N$ intermediate matrix. As we will see, it also slows down the computation itself. A natural question follows:
+
+> Can we keep softmax attention exactly as it is, with no approximation, but avoid storing the $N \times N$ intermediate matrix, and be faster at the same time?
+
+FlashAttention [@dao2022flashattention] gives a concrete answer. It still computes @eq-attention, with the same result as the standard implementation (up to floating-point rounding); only *how* it is computed changes. To understand why it works, we first need a bit of GPU hardware background.
+
+### Two levels of GPU memory: the warehouse and the workbench
+
+Data on a GPU lives mainly in two kinds of memory^[Only the two levels most relevant to attention are covered here. There are also registers, the L2 cache, CPU memory and so on.]:
+
+- **HBM (high-bandwidth memory)**: what we usually call "GPU memory". It is large, and holds the model parameters, inputs, outputs and intermediate results.
+- **SRAM (on-chip memory)**: sits next to the compute units; it is much faster but very small.
+
+| | HBM | SRAM |
+|---|---|---|
+| Capacity | 40–80 GB | 192 KB per SM, about 20 MB across 108 SMs |
+| Bandwidth | 1.5–2.0 TB/s | about 19 TB/s |
+
+: The two memory levels of an A100 GPU; an SM is a streaming multiprocessor (figures from @dao2022flashattention) {#tbl-gpu-memory}
+
+An analogy (@fig-memory): HBM is like a big warehouse that can hold everything, but it is far away and every trip takes time; SRAM is like the workbench in front of you, extremely quick to reach but with room for only a few things. For any computation, the GPU first moves data from the warehouse to the workbench, computes, and then moves the results back.
+
+::: {#fig-memory}
+{{< include _fig-memory.en.qmd >}}
+
+The GPU memory hierarchy: compute units can only work directly on data on the workbench (SRAM), and moving data between the workbench and the warehouse (HBM) is an order of magnitude slower.
+:::
+
+So how long an operation takes depends on which is slower, "computing" or "moving":
+
+- **Compute-bound**: every number brought in takes part in many operations. Large matrix multiplications are like this; the time goes into computing.
+- **Memory-bound**: every number brought in is used for only one or two operations and then sent back. Element-wise operations such as softmax, masking and dropout are like this; almost all the time goes into moving data.
+
+GPU compute has been growing faster than memory bandwidth, so more and more operations are bottlenecked by "moving" rather than "computing" [@dao2022flashattention].
+
+### How standard attention runs on a GPU
+
+The standard implementation (Algorithm 0 in the paper) has three steps. Each step is a separate GPU program (kernel), and each one writes its result back to HBM for the next step to read:
+
+| Step | Read from HBM | Write to HBM |
+|---|---|---|
+| ① $S = QK^\top$ | $Q$, $K$ | $S$ ($N \times N$) |
+| ② $P = \operatorname{softmax}(S)$ | $S$ ($N \times N$) | $P$ ($N \times N$) |
+| ③ $O = PV$ | $P$ ($N \times N$), $V$ | $O$ |
+
+: The three steps of standard attention {#tbl-standard-steps}
+
+$N \times N$ matrices move in and out of HBM four times in total. Step ② is the typical case: the softmax does just one exponential and one division per number, yet it has to haul $N^2$ numbers from the warehouse and back. Training adds element-wise operations such as masking and dropout, and every extra step is another round trip.
+
+The paper measured attention in GPT-2: the two matrix multiplications take only a small fraction of the time; most of it goes into masking, softmax and dropout, that is, into moving data [@dao2022flashattention]. This is the **fourth cost: data movement** mentioned at the end of the previous section.
+
+FlashAttention's goal is therefore clear: **never let the $N \times N$ matrix into the warehouse**. It only ever appears on the workbench, one small block at a time, used right away and then thrown away. That requires solving two problems:
+
+1. **Forward pass**: the softmax needs information about a whole row (its maximum and its sum), but a whole row doesn't fit on the workbench. How do we compute it block by block?
+2. **Backward pass**: the backward pass needs $P$. What do we do if we never stored it?
+
+These two problems correspond to FlashAttention's two core ideas.
+
+### Idea 1: compute in blocks, correcting as you go
+
+#### One row first
+
+Use the 4 words from @fig-pairs again and look only at the row for "fish". Suppose its scores against the 4 words are $[1, 3, 2, 5]$ (skipping the division by $\sqrt{d}$ for easy arithmetic), and replace the 4 words' values with the scalars $10, 20, 30, 40$.
+
+First, recall an implementation detail of softmax: to avoid numerical overflow, the maximum of the row is subtracted from every score before exponentiating^[The largest number fp16 can represent is about 65504, while $e^{12} \approx 160{,}000$, so slightly large scores would overflow. Multiplying numerator and denominator by $e^{-m}$ leaves the result unchanged but keeps every exponent at or below 0.].
+
+**Looking at the whole row at once (the standard way):**
+
+- maximum $m = 5$;
+- exponentials: $e^{1-5}, e^{3-5}, e^{2-5}, e^{5-5} \approx 0.018, 0.135, 0.050, 1$;
+- sum: $\ell \approx 0.018 + 0.135 + 0.050 + 1 = 1.203$;
+- weighted sum: $A \approx 0.018 \times 10 + 0.135 \times 20 + 0.050 \times 30 + 1 \times 40 = 44.38$;
+- output: $o = A / \ell \approx 36.9$.
+
+**In two blocks (the workbench holds only 2 words' keys and values at a time):**
+
+- **Block 1**, scores $[1, 3]$:
+  - block maximum $m = 3$;
+  - exponentials: $e^{1-3}, e^{3-3} \approx 0.135, 1$;
+  - sum $\ell \approx 1.135$, weighted sum $A \approx 0.135 \times 10 + 1 \times 20 = 21.35$.
+- **Block 2**, scores $[2, 5]$:
+  - the maximum changes from 3 to 5. Block 1's results were computed relative to 3; to switch them to 5, just multiply them all by the correction factor $e^{3-5} \approx 0.135$;
+  - sum: $\ell \approx 0.135 \times 1.135 + (e^{2-5} + e^{5-5}) \approx 0.153 + 1.050 = 1.203$;
+  - weighted sum: $A \approx 0.135 \times 21.35 + (0.050 \times 30 + 1 \times 40) \approx 2.88 + 41.50 = 44.38$.
+- **Finally**: $o = A / \ell \approx 36.9$, exactly the same as computing the whole row at once.
+
+Why is the correction factor right? Block 1 computed $e^{x-3}$, but what we really want is $e^{x-5}$, and the two differ by a constant factor: $e^{x-5} = e^{x-3} \cdot e^{3-5}$. Multiplying block 1's sum and weighted sum by $e^{3-5}$ therefore switches the reference point from 3 to 5.
+
+The key point: **the whole process only needs to remember three numbers: the current maximum $m$, sum $\ell$ and weighted sum $A$.** When a new block arrives, these three numbers are enough to update the result; there is no need to look back at the raw data of earlier blocks. However long a row is, it can be cut into small blocks and processed in turn. This trick is called online softmax [@milakov2018online].
+
+#### Then the whole table
+
+Zoom out from one row to the whole $4 \times 4$ score table (@fig-tiling). $Q$, $K$ and $V$ are each split into blocks of 2 words, which cuts the score table into four $2 \times 2$ blocks. Algorithm 1 of the paper visits them in this order:
+
+- **Outer loop**: load one block $K_j$, $V_j$ from HBM into SRAM;
+- **Inner loop**: for each block $Q_i$, load it together with its current results ($O_i$ and each row's $m$ and $\ell$) into SRAM, compute the $2 \times 2$ score block $S_{ij}$, update the results as above, and write them back to HBM.
+
+::: {#fig-tiling}
+{{< include _fig-tiling.en.qmd >}}
+
+Block-wise computation in FlashAttention. Left: the $4 \times 4$ score table is cut into four $2 \times 2$ blocks, computed in the order 1, 2, 3, 4 (outer loop over key/value blocks, inner loop over query blocks). Right: at step 1 the workbench holds only the first two words' data and one $2 \times 2$ score block; the warehouse never holds an $N \times N$ matrix.
+:::
+
+Every row meets its left block first and its right block second, which is exactly the "block 1, then block 2" process above. The score block $S_{ij}$ and its probabilities only ever exist in SRAM and are discarded after use. HBM only ever holds $Q$, $K$, $V$, $O$ and the two numbers $m$ and $\ell$ per row: **no $N \times N$ matrix at all**.
+
+Moreover, all of these steps are merged (fused) into **one** GPU program: once data is loaded, the multiplication, softmax, masking, dropout and second multiplication all happen in SRAM in one go, instead of being split into several programs that each make a round trip to HBM.
+
+::: {.callout-note collapse="true"}
+## Detail: the update rule and loop order of Algorithm 1
+Line 12 of Algorithm 1 updates the output as
+
+$$
+O_i \leftarrow \operatorname{diag}(\ell_i^{\text{new}})^{-1}\left(\operatorname{diag}(\ell_i)\, e^{m_i - m_i^{\text{new}}} O_i + e^{\tilde{m}_{ij} - m_i^{\text{new}}} \tilde{P}_{ij} V_j\right).
+$$
+
+Here $\operatorname{diag}(\ell_i)$ is the diagonal matrix with the vector $\ell_i$ on its diagonal; multiplying by it on the left "scales each row by that row's own number". So the formula is exactly the four steps of the one-row example: multiply back the old sum, switch the reference to the new maximum, add the new block's contribution, and divide by the new sum. The old sum has to be multiplied back first because the paper stores $O_i$ in HBM already divided by the sum.
+
+**Loop order**: the paper's outer loop runs over key/value blocks, so every iteration has to read $O_i$ from HBM, update it and write it back. FlashAttention-2 [@dao2024flashattention2] reverses the order, with the outer loop over query blocks: $O_i$ stays in SRAM and is written to HBM only once, after all blocks are processed, and different query blocks can be computed on different compute units at the same time. The two orders are mathematically identical. I plan to cover this in more detail in a later update.
+:::
+
+::: {.callout-tip collapse="true"}
+## Code: a block-wise forward pass in 20 lines, checked against the standard one
+For readability this follows FlashAttention-2's order (outer loop over query blocks). The real FlashAttention is written in CUDA; this Python code only illustrates the logic: it never builds the full $N \times N$ matrix, and the largest score block is `block × block`.
+
+```python
+import torch
+
+def flash_attention_forward(Q, K, V, block=2):
+    """Compute softmax(Q K^T / sqrt(d)) V block by block"""
+    N, d = Q.shape
+    O = torch.empty_like(Q)
+    for i in range(0, N, block):                        # one block of queries
+        q = Q[i:i + block] / d**0.5
+        m = torch.full((q.shape[0], 1), float("-inf"))  # current maximum of each row
+        l = torch.zeros(q.shape[0], 1)                  # current sum of each row
+        A = torch.zeros(q.shape[0], d)                  # current weighted sum of each row
+        for j in range(0, N, block):                    # one block of keys and values
+            s = q @ K[j:j + block].T                    # only block × block
+            m_new = torch.maximum(m, s.max(dim=1, keepdim=True).values)
+            scale = torch.exp(m - m_new)                # correction factor for old results
+            p = torch.exp(s - m_new)
+            l = scale * l + p.sum(dim=1, keepdim=True)
+            A = scale * A + p @ V[j:j + block]
+            m = m_new
+        O[i:i + block] = A / l
+    return O
+
+Q, K, V = torch.randn(3, 8, 4).unbind(0)                # N = 8, d = 4
+reference = torch.softmax(Q @ K.T / 4**0.5, dim=-1) @ V
+print(torch.allclose(flash_attention_forward(Q, K, V), reference, atol=1e-6))  # True
+```
+:::
+
+### Idea 2: recompute in the backward pass instead of storing
+
+The forward pass no longer stores $P$, but the backward pass needs it (as noted earlier, the gradient of $V$ is $P^\top$ times the gradient of the output). FlashAttention's answer: during the forward pass, also save each row's maximum $m$ and sum $\ell$, just 2 numbers per row, $2N$ in total instead of $N^2$. Whenever the backward pass needs a block of $P$, it recomputes that block's scores from $Q$ and $K$ and uses the stored $m$ and $\ell$ to get the exact probabilities directly:
+
+$$
+P_{ij} = \frac{e^{S_{ij} - m_i}}{\ell_i}.
+$$
+
+Unlike the forward pass, each row's final $m$ and $\ell$ are already known, so every block can be computed exactly in one step, with no corrections along the way. Check with the "fish" row: the forward pass saved $m = 5$ and $\ell \approx 1.203$. Recomputing block 1 in the backward pass, with scores $[1, 3]$, gives probabilities $e^{1-5} / 1.203 \approx 0.015$ and $e^{3-5} / 1.203 \approx 0.112$, the same as a softmax over the whole row^[The dropout mask is $N \times N$ too. FlashAttention doesn't store it either; it saves the state of the random number generator and regenerates the same mask in the backward pass.].
+
+Recomputing means extra computation: the backward pass computes $QK^\top$ again. But that work happens in fast SRAM, and in exchange the $N \times N$ $P$ never has to be written to and read back from HBM. The paper's measurements on GPT-2 medium make the point:
+
+| | Standard attention | FlashAttention |
+|---|---|---|
+| Compute (GFLOPs) | 66.6 | 75.2 |
+| HBM reads and writes (GB) | 40.3 | 4.4 |
+| Runtime (ms) | 41.7 | 7.3 |
+
+: Forward plus backward cost on GPT-2 medium (sequence length 1024, head dimension 64, 16 heads, batch size 64), A100 [@dao2022flashattention] {#tbl-flash-cost}
+
+Compute goes up by about 13%, but HBM traffic drops about 9×, and the result runs about 5.7× faster. For attention, the real bottleneck is moving data, not computing.
+
+### Why it is both faster and lighter on memory
+
+Putting the two ideas together and comparing with the standard implementation (these results are derived in the paper):
+
+| | Standard | FlashAttention |
+|---|---|---|
+| Compute | $O(N^2 d)$ | $O(N^2 d)$, plus one more $QK^\top$ in the backward pass |
+| HBM reads and writes | $O(N^2 + Nd)$ | $O(N^2 d^2 / M)$ |
+| Extra memory | $O(N^2)$ | $O(N)$ |
+
+: Standard attention versus FlashAttention; $M$ is the number of values SRAM can hold {#tbl-flash-compare}
+
+- **Less memory**: no $N \times N$ matrix is stored; the only extra storage is $m$ and $\ell$ per row, so memory drops from $N^2$ to $N$.
+- **Less data movement**: the standard implementation moves the $N \times N$ matrices in and out several times. FlashAttention doesn't move them at all; the price is reading $Q$ and $O$ a few more times. As long as the square of the head dimension $d$ is much smaller than the SRAM capacity $M$, the latter is much less traffic.
+- **Faster**: attention is bottlenecked by data movement, so moving less makes it faster.
+
+::: {.callout-note collapse="true"}
+## Detail: where the $N^2 d^2 / M$ traffic comes from
+Note that $M$ counts how many numbers fit, not bytes. The paper estimates about 100 KB of usable SRAM on an A100, which is about 50,000 numbers in fp16.
+
+1. SRAM has to hold four kinds of blocks at once, $K_j$, $V_j$, $Q_i$ and $O_i$, so each block has at most $M / (4d)$ rows;
+2. $K$ and $V$ are therefore split into $N / (M / 4d) = 4Nd / M$ blocks;
+3. for each block $K_j$, $V_j$, the whole of $Q$ and $O$ is scanned once, moving $O(Nd)$ numbers per pass;
+4. in total, $O(Nd) \times O(Nd / M) = O(N^2 d^2 / M)$.
+
+Compared with the standard implementation's $N^2$, the ratio is about $d^2 / M$. With $d = 64$, $d^2 = 4096$ is about 12 times smaller than $M$; with $d = 128$ it is only about 3 times smaller, which is why the paper finds smaller speedups for larger head dimensions.
+:::
+
+### Experimental results
+
+The paper replaced the attention in several mainstream models with FlashAttention:
+
+- **Faster training**: BERT-large trains 15% faster than the MLPerf 1.1 speed record (17.4 versus 20.0 minutes on 8 A100s); GPT-2 trains about 3× faster than the HuggingFace implementation and about 1.7× faster than Megatron-LM.
+- **Same results**: training GPT-2 with either implementation gives validation perplexity curves that almost exactly overlap. That is what "exact" means here: no approximation is involved.
+- **Less memory**: at sequence length 4K, attention uses about 20× less memory than the standard PyTorch implementation (836 MB versus 17,024 MB), and memory grows linearly with length, all the way to 64K.
+- **Longer sequences**: extending GPT-2's context from 1K to 4K still trains 30% faster than Megatron-LM's 1K version, with perplexity dropping from 18.2 to 17.5. On the Path-X task, which needs 16K tokens, a Transformer beat random guessing for the first time (61.4%).
+
+A note on inference: FlashAttention speeds up the forward computation, so the stage that processes a long input all at once (prefill) benefits too; but in token-by-token generation each step has only one new query, and the bottleneck is reading the ever-larger KV cache, where the first version of FlashAttention helps little. The later Flash-Decoding [@dao2023flashdecoding] targets this stage specifically (I hope to cover it in a later post).
+
+### What it doesn't solve
+
+FlashAttention makes standard attention several times faster without changing its result, and saves the $N^2$ memory. But it doesn't change attention itself:
+
+- **Computation is still $N^2$**: as sequences keep growing, compute eventually becomes the bottleneck, however little data is moved;
+- **The KV cache at inference still grows with $N$**: every new word has to read the keys and values of all previous words.
+
+To truly get rid of $N^2$, we have to change *what* we compute. That is the Linear Attention of the next section.
+
+## Linear Attention: changing what we compute
+
+### Prologue: starting from Qwen3.5
+
+I started looking into linear attention because Qwen3.5's MoE models use a 3:1 hybrid design: in every 4 layers, 3 use an improved form of linear attention (Gated DeltaNet) and only 1 uses standard attention^[Strictly speaking, it is Gated Attention: standard softmax attention with a gate applied to its output, so its cost still grows as $N^2$. In Qwen3.5-397B-A17B, for example, the 60 layers are exactly 15 groups of "3 Gated DeltaNet layers + 1 Gated Attention layer"; see the [official model card](https://huggingface.co/Qwen/Qwen3.5-397B-A17B).]. I was curious: what is so special about linear attention that it can take over most of the layers? So I started from the classic paper in this line of work [@katharopoulos2020transformers]. Reading it, I discovered that it was proposed precisely to solve the problem this post is about: keeping the computation of attention from growing as $N^2$.
+
+Let's walk through the paper's line of thought.
+
+### Step 1: see softmax as a similarity
+
+Write out row $i$ of @eq-attention on its own (for brevity, $1/\sqrt{d}$ is dropped; it can be folded into $q_i$):
+
+$$
+o_i = \frac{\sum_{j} \exp(q_i^\top k_j)\, v_j}{\sum_{j} \exp(q_i^\top k_j)}.
+$$
+
+This is just a weighted average: the weights come from the similarity between word $i$'s query and each word's key, and softmax uses $\exp(q^\top k)$ as the similarity. The paper generalizes it to any similarity function $\operatorname{sim}(q, k)$:
+
+$$
+o_i = \frac{\sum_{j} \operatorname{sim}(q_i, k_j)\, v_j}{\sum_{j} \operatorname{sim}(q_i, k_j)}.
+$$ {#eq-general-attention}
+
+With $\operatorname{sim}(q, k) = \exp(q^\top k)$ we are back to standard softmax attention.
+
+### Step 2: drop the softmax and use associativity
+
+Now suppose the similarity can be written as a dot product of two vectors, $\operatorname{sim}(q, k) = \phi(q)^\top \phi(k)$, where $\phi$ is a function that maps one vector to another (where it comes from is explained later). Substituting into the numerator of @eq-general-attention:
+
+$$
+\sum_{j} \big(\phi(q_i)^\top \phi(k_j)\big)\, v_j^\top
+= \phi(q_i)^\top \underbrace{\sum_{j} \phi(k_j)\, v_j^\top}_{S}.
+$$
+
+The key step: $\phi(q_i)$ does not depend on the summation index $j$, so it can be pulled out of the sum. What remains, $S = \sum_j \phi(k_j) v_j^\top$, does not depend on which query we are looking at, so **it is computed once and shared by all queries**. The denominator works the same way: $\sum_j \phi(q_i)^\top \phi(k_j) = \phi(q_i)^\top z$, where $z = \sum_j \phi(k_j)$.
+
+In matrix form, this simply changes the order of multiplication:
+
+$$
+\big(\phi(Q)\, \phi(K)^\top\big)\, V = \phi(Q)\, \big(\phi(K)^\top V\big).
+$$ {#eq-assoc}
+
+Associativity of matrix multiplication guarantees the two sides are identical, but their costs are worlds apart (@fig-assoc): the left side first builds an $N \times N$ matrix, while $\phi(K)^\top V$ on the right is only $d \times d$.
+
+::: {#fig-assoc}
+{{< include _fig-assoc.en.qmd >}}
+
+Two orders of computing the same result. Order 1's intermediate is an $N \times N$ matrix that grows with the square of the sequence length; order 2's intermediate is only $d \times d$, independent of the sequence length.
+:::
+
+| | Order 1: compute $\phi(Q)\phi(K)^\top$ first | Order 2: compute $\phi(K)^\top V$ first |
+|---|---|---|
+| Intermediate | $N \times N$ | $d \times d$ |
+| Cost (multiply-adds) | $2N^2 d$ | $2Nd^2$ |
+
+: The two computation orders (assuming $\phi$ keeps the dimension) {#tbl-assoc}
+
+The ratio of the two costs is $N/d$. With $N = 4096$ and $d = 64$, order 2 costs only 1/64 of order 1. The longer the sequence, the bigger the saving: computation now grows linearly with $N$ instead of quadratically.
+
+### A worked example
+
+Reuse $Q$, $K$ and $V$ from the earlier small worked example, with the paper's choice $\phi(x) = \operatorname{elu}(x) + 1$ (why this choice is explained later). For non-negative numbers it just adds 1, so 0 becomes 1 and 1 becomes 2:
+
+$$
+\phi(Q) = \begin{bmatrix} 2 & 1 \\ 1 & 2 \\ 2 & 2 \end{bmatrix}, \quad
+\phi(K) = \begin{bmatrix} 2 & 2 \\ 1 & 2 \\ 2 & 1 \end{bmatrix}, \quad
+V = \begin{bmatrix} 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{bmatrix}.
+$$
+
+**Order 1**: first compute the $3 \times 3$ similarity matrix
+
+$$
+\phi(Q)\, \phi(K)^\top = \begin{bmatrix} 6 & 4 & 5 \\ 6 & 5 & 4 \\ 8 & 6 & 6 \end{bmatrix}.
+$$
+
+Row 1 sums to 15; after normalizing and multiplying by $V$, the output of word 1 is $\frac{1}{15}\big(6 \times (1, 0) + 4 \times (0, 1) + 5 \times (1, 1)\big) = \big(\frac{11}{15}, \frac{9}{15}\big)$.
+
+**Order 2**: first compute the $2 \times 2$ $S$ and the 2-dimensional $z$:
+
+$$
+S = \phi(K)^\top V = \begin{bmatrix} 4 & 3 \\ 3 & 3 \end{bmatrix}, \qquad z = \sum_j \phi(k_j) = (5, 5).
+$$
+
+For word 1, $\phi(q_1) = (2, 1)$. The numerator is $\phi(q_1)^\top S = (2 \times 4 + 1 \times 3,\ 2 \times 3 + 1 \times 3) = (11, 9)$ and the denominator is $\phi(q_1)^\top z = 2 \times 5 + 1 \times 5 = 15$, so the output is again $\big(\frac{11}{15}, \frac{9}{15}\big)$.
+
+Both orders give the same result, but order 2 never builds a $3 \times 3$ matrix. The size of $S$ depends only on the dimension $d$: however long the sequence, it stays $2 \times 2$.
+
+### Why softmax can't do this: the kernel view
+
+The derivation above relied on just one assumption: that the similarity splits into $\phi(q)^\top \phi(k)$. Why doesn't softmax's $\exp(q^\top k)$ work? Kernel functions explain it, and that is also why the paper calls $\phi$ a "kernel feature map". The idea of viewing attention through kernels comes from the earlier work of @tsai2019transformer.
+
+**What a kernel is.** A kernel $\kappa(x, y) = \phi(x)^\top \phi(y)$ first maps two vectors into another space (usually of higher dimension) with $\phi$, then takes their dot product there. For example, with $x = (1, 2)$, $y = (3, 1)$ and the second-order polynomial kernel $\kappa(x, y) = (x^\top y)^2$:
+
+- **Directly**: $x^\top y = 1 \times 3 + 2 \times 1 = 5$, and squaring gives 25;
+- **Through the feature space**: with $\phi(x) = (x_1^2, \sqrt{2}\, x_1 x_2, x_2^2)$ we get $\phi(x) = (1, 2\sqrt{2}, 4)$ and $\phi(y) = (9, 3\sqrt{2}, 1)$, whose dot product is $9 + 12 + 4 = 25$.
+
+Both give the same answer. In support vector machines (SVMs), the beauty of kernels is that you only ever use the first way and never have to construct $\phi$. When the feature space is very high-dimensional or even infinite-dimensional, that is the only feasible way.
+
+**Linear attention uses kernels in exactly the opposite direction**: it **must** compute $\phi$ explicitly, because only with the two halves $\phi(q)$ and $\phi(k)$ in hand can $\phi(q_i)$ be pulled out of the sum.
+
+**The exp kernel is infinite-dimensional.** $\exp(q^\top k)$ is a kernel too, but its $\phi$ is infinite-dimensional:
+
+$$
+\exp(q^\top k) = 1 + q^\top k + \frac{(q^\top k)^2}{2!} + \frac{(q^\top k)^3}{3!} + \cdots
+$$
+
+Every term of the expansion corresponds to a set of features (first order, second order, third order and so on), and the list never ends. So softmax attention can only compute $\exp(q^\top k)$ directly for each pair $(q, k)$, which is exactly the SVM way of using a kernel, and the price is computing all $N^2$ pairs.
+
+In matrix terms: exp is applied element-wise to $QK^\top$, and $\exp(QK^\top)$ cannot be written as a product of two finite matrices, so there is no way to compute $K^\top V$ first. Note that the problem is not associativity: associativity holds for any matrix product; softmax simply never gives us three matrices whose order could be changed.
+
+### Why it's called linear attention
+
+The "linear" in the name first refers to computation growing **linearly** with sequence length, from $O(N^2)$ down to $O(N)$. It can be linear because the similarity is replaced by a dot product $\phi(q)^\top \phi(k)$; the paper calls this "linearizing" attention (its §3.2 is titled Linearized Attention), and that is what makes associativity usable.
+
+Later literature adds another meaning to "linear": as we will see, the state is updated by a linear recurrence, without the nonlinear activations of an ordinary RNN, so it is also called a linear RNN [@yang2024gated].
+
+### The paper's choice of $\phi$: elu + 1
+
+With the kernel view in mind, designing linear attention becomes choosing $\phi$. The paper uses
+
+$$
+\phi(x) = \operatorname{elu}(x) + 1 =
+\begin{cases}
+x + 1, & x > 0, \\
+e^{x}, & x \le 0,
+\end{cases}
+$$ {#eq-elu}
+
+applied element-wise, with a $d$-dimensional output just like the input. elu is the exponential linear unit [@clevert2016fast].
+
+**Why it must be positive.** The paper keeps softmax's denominator, the normalization in @eq-general-attention. If similarities could be positive or negative, the denominator could get close to 0 or even change sign. For example, if two words had similarities 1.0 and −0.99, the denominator would be just 0.01 and the weights would become 100 and −99; the output would blow up and so would the gradients. Every component of elu + 1 is greater than 0, so the dot product of two such vectors is always positive and the denominator is safe^[The paper also notes that relu is not used because its gradient is always 0 for negative inputs.]. This is also why the raw $q$ and $k$ can't be used directly: $q^\top k$ can be positive or negative.
+
+**Advantages:**
+
+- **Cheap**: just an element-wise operation that doesn't increase the dimension, so the state $S$ is only $d \times d$;
+- **Numerically safe**: similarities are always positive, so normalization is never a problem.
+
+**Costs:**
+
+- **It is not an approximation of exp**: elu + 1 defines a different, finite-dimensional kernel, so linear attention is a new model, not "a faster way to compute softmax".
+- **Less focused attention**: exp can push the weights of relevant and irrelevant words enormously far apart, while elu + 1 grows only linearly for positive inputs, so the weights tend to get "flattened".
+- **Limited memory capacity**: all of the history has to be squeezed into the $d \times d$ matrix $S$, and with many words the entries interfere with each other (more on this later). The paper's speech recognition experiment already shows a gap: linear attention's phoneme error rate is 8.08%, versus 5.12% for softmax.
+
+### The causal version: accumulate as you read
+
+Language models need a causal mask: word $i$ may only see the first $i$ words. Word $i$ then no longer needs the shared $S$ but its own "prefix sum":
+
+$$
+S_i = \sum_{j \le i} \phi(k_j)\, v_j^\top, \qquad
+z_i = \sum_{j \le i} \phi(k_j), \qquad
+o_i = \frac{\phi(q_i)^\top S_i}{\phi(q_i)^\top z_i}.
+$$ {#eq-causal-linear}
+
+Recomputing each prefix sum from scratch would bring the cost back to $N^2$. But two consecutive prefix sums differ by only one term:
+
+$$
+S_i = S_{i-1} + \phi(k_i)\, v_i^\top, \qquad z_i = z_{i-1} + \phi(k_i).
+$$ {#eq-recurrence}
+
+Scan once from left to right, adding each new word's $\phi(k_i) v_i^\top$ into $S$. Each step costs $O(d^2)$ regardless of how many words have been processed, so the total cost is $O(Nd^2)$.
+
+Continuing the example above, this time with the causal mask:
+
+- **Word 1**: $S_1 = \phi(k_1) v_1^\top = \begin{bmatrix} 2 & 0 \\ 2 & 0 \end{bmatrix}$, $z_1 = (2, 2)$;
+- **Word 2**: $S_2 = S_1 + \phi(k_2) v_2^\top = \begin{bmatrix} 2 & 1 \\ 2 & 2 \end{bmatrix}$, $z_2 = (3, 4)$;
+- **Word 3**: $S_3 = S_2 + \phi(k_3) v_3^\top = \begin{bmatrix} 4 & 3 \\ 3 & 3 \end{bmatrix}$, $z_3 = (5, 5)$.
+
+Take word 2: $\phi(q_2) = (1, 2)$, and its output is $\phi(q_2)^\top S_2 / \phi(q_2)^\top z_2 = (6, 5) / 11$, the same as masking out word 3 in row 2 of the similarity matrix and renormalizing. The final $S_3$ is exactly the unmasked $S$ from before: the last word can see every word anyway.
+
+### It's really an RNN
+
+Look at @eq-recurrence from another angle and it is a recurrent neural network:
+
+- the **state** is $S$ (and $z$), with a fixed size of $d \times d$ that doesn't grow with the sequence;
+- each incoming word updates the state once with $\phi(k_i) v_i^\top$;
+- the output is obtained by "reading" the state with $\phi(q_i)$.
+
+That is where the paper's title, "Transformers are RNNs", comes from. It also solves the inference problem from the second cost:
+
+- **No KV cache**: standard attention has to store every previous word's key and value, while linear attention only stores one $d \times d$ matrix $S$ and one $d$-dimensional vector $z$;
+- **Constant cost per generated word**: generation doesn't slow down as it goes.
+
+At the same time, it keeps the Transformer's parallel training. The state update contains only additions and no nonlinear functions, so during training, with the whole sequence known, all prefix sums can be computed at once with a parallel algorithm instead of waiting step by step like a traditional RNN^[The paper's own implementation accumulates sequentially over time; later work such as GLA [@yang2024gated] developed efficient chunk-wise parallel algorithms (I hope to cover these in a later post).].
+
+::: {.callout-tip collapse="true"}
+## Code: both computation orders, and the RNN form
+The code below implements unmasked linear attention (order 2) and the causal recurrent form (@eq-recurrence), and checks both against computing the full $N \times N$ similarity matrix directly.
+
+```python
+import torch
+import torch.nn.functional as F
+
+def phi(x):
+    return F.elu(x) + 1
+
+def linear_attention(Q, K, V):
+    """Unmasked: compute φ(K)^T V first, shared by all queries"""
+    Qf, Kf = phi(Q), phi(K)
+    S = Kf.T @ V                                  # (d, d), independent of N
+    z = Kf.sum(dim=0)                             # (d,)
+    return (Qf @ S) / (Qf @ z)[:, None]
+
+def causal_linear_attention(Q, K, V):
+    """Causal: accumulate the state S and z left to right, like an RNN"""
+    Qf, Kf = phi(Q), phi(K)
+    S = torch.zeros(Q.shape[1], V.shape[1])
+    z = torch.zeros(Q.shape[1])
+    out = []
+    for i in range(Q.shape[0]):
+        S = S + torch.outer(Kf[i], V[i])          # S_i = S_{i-1} + φ(k_i) v_i^T
+        z = z + Kf[i]
+        out.append(Qf[i] @ S / (Qf[i] @ z))
+    return torch.stack(out)
+
+Q, K, V = torch.randn(3, 6, 4).unbind(0)          # N = 6, d = 4
+sim = phi(Q) @ phi(K).T                           # (N, N) similarity matrix, only for checking
+print(torch.allclose(linear_attention(Q, K, V), (sim / sim.sum(1, keepdim=True)) @ V, atol=1e-6))
+masked = sim.tril()                               # mask the upper-right triangle
+print(torch.allclose(causal_linear_attention(Q, K, V), (masked / masked.sum(1, keepdim=True)) @ V, atol=1e-6))
+```
+:::
+
+### The backward pass: also accumulate as you scan
+
+Training also needs a backward pass. If @eq-recurrence were handed straight to automatic differentiation, it would store every $S_i$ for the backward pass: $N$ matrices of size $d \times d$, $O(Nd^2)$ memory, roughly $d$ times the size of the inputs and outputs.
+
+The paper shows that the gradients can be written in the same accumulated form (equations 13–15 of the paper, written here with column vectors throughout). Let $\bar{v}_i = S_i^\top \phi(q_i)$ be the output before normalization, the numerator in @eq-causal-linear, and let $g_i$ be the gradient of the loss with respect to it. Then
+
+$$
+\nabla_{\phi(q_i)} \mathcal{L} = S_i\, g_i, \qquad
+\nabla_{\phi(k_i)} \mathcal{L} = R_i\, v_i, \qquad
+\nabla_{v_i} \mathcal{L} = R_i^\top \phi(k_i),
+$$ {#eq-linear-grad}
+
+where
+
+$$
+S_i = \sum_{j \le i} \phi(k_j)\, v_j^\top, \qquad
+R_i = \sum_{j \ge i} \phi(q_j)\, g_j^\top.
+$$
+
+Two things can be read off these formulas:
+
+- $S_i$ is the forward prefix sum, accumulated front to back;
+- $R_i$ is a "suffix sum", accumulated back to front: $R_i = R_{i+1} + \phi(q_i)\, g_i^\top$. It mirrors the forward pass exactly, just in the opposite direction, much like backpropagation through time in an RNN.
+
+So the backward pass doesn't need to store every $S_i$ either: scan front to back once, accumulating $S_i$ and computing the gradients of $q$; then scan back to front, accumulating $R_i$ and computing the gradients of $k$ and $v$. Each step maintains just one $d \times d$ accumulator, the time is $O(Nd^2)$, and the extra memory drops to $O(Nd)$ (Algorithm 1 in the paper).
+
+One more point: the output is the numerator divided by the denominator. The numerator $\bar{v}_i = S_i^\top \phi(q_i)$ uses the $d \times d$ state, while the denominator $\phi(q_i)^\top z_i$ only uses the $d$-dimensional $z_i$. The formulas above only cover the numerator. The denominator needs no special treatment: automatic differentiation only has to store each step's $z_i$, $N \times d$ numbers in total, as large as $\phi(K)$ itself, so memory is not a problem (@tbl-num-den). In practice, the numerator gets a hand-written backward pass based on the paper's accumulation formulas, the denominator is left to automatic differentiation, and the chain rule adds the gradients from the two paths.
+
+| | Numerator path | Denominator path |
+|---|---|---|
+| Formula | $\bar{v}_i = S_i^\top \phi(q_i)$ | $\phi(q_i)^\top z_i$ |
+| Accumulated quantity | $S_i$: a $d \times d$ matrix | $z_i$: a $d$-dimensional vector |
+| What autodiff would store | $N$ matrices of $d \times d$, $Nd^2$ numbers | $N$ vectors of dimension $d$, $Nd$ numbers |
+| With $N = 4096$, $d = 64$ | about 16.8 million numbers (about 32 MB in fp16) | about 262,000 numbers (about 0.5 MB in fp16) |
+| Handling | hand-written backward pass from @eq-linear-grad | left to automatic differentiation |
+
+: What the numerator and denominator paths would store in the backward pass (one head, one layer) {#tbl-num-den}
+
+In other words, the pattern of "keep a fixed-size state and accumulate as you scan" holds in both the forward and the backward pass. Later improvements mostly keep this skeleton and change how the state is updated.
+
+### Experimental results
+
+The paper compares linear attention with standard softmax attention on several kinds of tasks:
+
+- **Copy task**: a synthetic task in which the model has to copy a sequence of symbols verbatim, with sequences up to length 128. Linear attention converges normally and reaches the same final loss as softmax.
+- **Speed and memory**: linear attention's time and memory both grow linearly with sequence length. On a GTX 1080 Ti with 11 GB of memory, softmax can only go up to length 4096, while linear attention goes all the way to 65536.
+- **Image generation**: generating images pixel by pixel. Quality is close to softmax: 0.644 bits/dim on MNIST (lower is better) versus 0.621 for softmax. Generation is much faster: 317× on MNIST and 4462× on CIFAR-10.
+- **Speech recognition**: each training epoch takes only about a third of softmax's time (824 versus 2711 seconds), but the phoneme error rate is 8.08% versus 5.12% for softmax, a clear gap.
+
+::: {.callout-warning}
+## The fine print behind "4000× faster"
+- **What it is compared with**: the paper's softmax baseline doesn't use a KV cache, so every new pixel recomputes all previous pixels. Compared with a version that does cache keys and values, linear attention is only about 19× (MNIST) and 56× (CIFAR-10) faster.
+- **It is throughput**: linear attention's memory is constant, so it can generate many images at once (10,000 MNIST images in one go). With batch size 1, generating one CIFAR-10 image on a GPU is only about 1.14× faster than softmax with a KV cache.
+- **Quality on CIFAR-10**: linear attention's 3.40 beats softmax's 3.47 because, in the same 7 days of training, it ran about 3 times as many epochs; aligned by epoch, softmax is still better.
+:::
+
+So the efficiency gains are real, but a quality gap is already showing. Where does it come from? Back to the foreshadowing from earlier: all of the history has to be squeezed into a fixed-size $S$.
+
+### The cost: limited memory
+
+Think of the state $S$ in @eq-recurrence as a memory:
+
+- **Write**: each word performs $S \mathrel{+}= \phi(k)\, v^\top$, storing its value under its key;
+- **Read**: query it with $\phi(q)^\top S$. The more the query resembles a key, the more of that key's value is read out.
+
+To see clearly what gets read out, ignore the denominator for now, take $\phi$ to be the identity (use the raw keys), and make the three values one-hot vectors: $v_1 = (1, 0, 0)$, $v_2 = (0, 1, 0)$, $v_3 = (0, 0, 1)$. The three components of a read-out then tell us how much of $v_1$, $v_2$ and $v_3$ was read.
+
+**First store two orthogonal keys**: $k_1 = (1, 0)$ and $k_2 = (0, 1)$.
+
+$$
+S = k_1 v_1^\top + k_2 v_2^\top = \begin{bmatrix} 1 & 0 & 0 \\ 0 & 1 & 0 \end{bmatrix}.
+$$
+
+Reading with $k_1$, $k_1^\top S$ picks out exactly row 1, $(1, 0, 0)$, which is $v_1$; reading with $k_2$ gives $v_2$. Perfectly accurate.
+
+**Now store a third key**: $k_3 = (0.707, 0.707)$, pointing at 45° with length 1.
+
+$$
+S = \begin{bmatrix} 1 & 0 & 0.707 \\ 0 & 1 & 0.707 \end{bmatrix}.
+$$
+
+Reading with $k_1$ again gives $(1, 0, 0.707) = v_1 + 0.707\, v_3$. We only wanted $v_1$, but 0.707 of $v_3$ got mixed in. This is **crosstalk** (@fig-crosstalk).
+
+::: {#fig-crosstalk}
+{{< include _fig-crosstalk.en.qmd >}}
+
+2-dimensional keys have at most 2 mutually orthogonal directions. The third key (orange) is orthogonal to neither of the others, so reading with any key mixes in other values.
+:::
+
+Expanding the read shows where the crosstalk comes from:
+
+$$
+k_1^\top S = \sum_{j} (k_1^\top k_j)\, v_j^\top.
+$$
+
+The coefficient of each $v_j$ is the dot product of $k_1$ and $k_j$. $k_1$ and $k_2$ are orthogonal, so the coefficient is 0; $k_1$ and $k_3$ are 45° apart, so the coefficient is $\cos 45° \approx 0.707$. **Whenever two keys are not orthogonal, reading one of them pulls the other one out as well.**
+
+And a 2-dimensional plane has at most 2 mutually orthogonal directions; wherever the third key goes, it can't be orthogonal to both of the others. In general: **$d$-dimensional keys can keep at most $d$ pieces of information from interfering**. The paper's elu + 1 doesn't change the dimension, so it has the same limit. Yet a language model's $S$ has to hold the whole context, where $N$ is often hundreds or thousands of times $d$ (for example $d = 128$, $N = 32$K), so crosstalk is unavoidable^[This view of linear attention as a memory whose capacity is limited by its dimension comes from @schlag2021linear, which connected linear attention to the fast weights of the 1990s.].
+
+An analogy: $S$ is a cabinet with only $d$ drawers, and each key decides which drawers its item goes into and how much goes in each. $k_1$ and $k_2$ each get a drawer of their own; $k_3$ has no drawer of its own and has to be split across both. From then on, whoever opens the first drawer also gets part of $v_3$.
+
+This is exactly what softmax can do and linear attention can't. Softmax doesn't compress the history into a fixed-size state; it keeps every key (the KV cache) and uses exp to amplify the weight of the best-matching key until it dominates everything else, so it can precisely retrieve one word out of thousands. Linear attention trades that for a fixed-size state and constant inference cost; the price is a ceiling on memory.
+
+**Higher dimensions help, at a cost.** The amount of crosstalk equals the dot product of two keys. If $\phi$ first maps keys into a higher-dimensional space, different keys can sit further apart there. For example, the second-order polynomial $\phi(x) = (x_1^2, \sqrt{2}\, x_1 x_2, x_2^2)$ maps 2-dimensional keys into 3 dimensions, and the dot product between unit-length keys changes from $\cos\theta$ to $\cos^2\theta$:
+
+| $\phi$ | Feature dimension | $v_3$ mixed in when reading with $k_1$ |
+|---|---|---|
+| Identity (raw keys) | 2 | 0.707 |
+| Second-order polynomial | 3 | 0.5 |
+| Fourth-order polynomial | 5 | 0.25 |
+
+: Higher dimensions reduce crosstalk ($k_1$ and $k_3$ are 45° apart) {#tbl-crosstalk}
+
+The higher the order, the closer different keys are to orthogonal and the less crosstalk. The price is that the state $S$ becomes $C \times d$ (where $C$ is the output dimension of $\phi$) and the cost becomes $O(NCd)$, while $C$ grows quickly with the order: with $d = 64$, the second-order polynomial already has $C = 4096$ (2080 after removing duplicate terms), making the state dozens of times larger. softmax's exp kernel is effectively infinite-dimensional and can push crosstalk almost to 0, which is why it can retrieve precisely; the price is going back to $N^2$.
+
+**Even orders have a side effect: opposite counts as similar.** Squaring erases the sign: $\cos 135° = -0.707$ becomes $+0.5$ after squaring, the same as a key at 45°. In the extreme, $\phi(k) = \phi(-k)$: a key pointing exactly away from the query gets the same weight as a perfectly matching key. With $q = (1, 0)$, compare the (normalized) weights of three keys:
+
+| Key | $q^\top k$ | softmax: $e^{q^\top k}$ | Second-order polynomial: $(q^\top k)^2$ | Taylor: $1 + q^\top k + \frac{1}{2}(q^\top k)^2$ |
+|---|---|---|---|---|
+| Matching $(1, 0)$ | 1 | 0.665 | 0.5 | 0.625 |
+| Orthogonal $(0, 1)$ | 0 | 0.245 | 0 | 0.25 |
+| Opposite $(-1, 0)$ | −1 | 0.090 | 0.5 | 0.125 |
+
+: The squared kernel treats "opposite" as "similar" ($q = (1, 0)$) {#tbl-sign}
+
+softmax weights increase monotonically with the dot product: the more aligned, the larger; the more opposed, the smaller. @zhang2024hedgehog list this **monotonicity** as one of the key properties of softmax. The squared kernel breaks it: to make the model ignore a word, softmax only needs that word's key to point away from the query, while the squared kernel needs the key to be exactly orthogonal to it, a much narrower target.
+
+The fix is to keep the lower-order terms alongside the square. The kernel used by Based [@arora2024simple], $1 + q^\top k + \frac{1}{2}(q^\top k)^2$, is exactly the second-order Taylor expansion of $\exp(q^\top k)$ (feature dimension $1 + d + d^2$). It is always positive (its minimum is 0.5, at $q^\top k = -1$) and increases monotonically for $q^\top k > -1$; the weights in the table above are already close to softmax. But it only resembles exp while the dot product isn't too negative: at $q^\top k = -2$ it equals 1, while $e^{-2} \approx 0.14$. @zhang2024hedgehog also note that the Taylor expansion stays monotonic only when dot products are bounded.
+
+### Rules for choosing $\phi$
+
+Putting the discussion together, a few requirements need to be balanced when designing $\phi$:
+
+1. **Non-negative**: as long as the denominator is kept, similarities must be positive (discussed earlier).
+2. **Monotonic**: the more aligned a query and key, the larger the weight should be; the more opposed, the smaller (@tbl-sign).
+3. **Dimension sets capacity**: the output dimension $C$ of $\phi$ sets the size of the state $S$, and with it how many pieces of information can be stored cleanly.
+4. **Discrimination**: a good $\phi$ makes unrelated keys as close to orthogonal as possible in feature space, so attention is "sharp" and crosstalk is small.
+5. **Cheap to compute**: the larger $C$, the larger the state and the $O(NCd)$ cost; it mustn't eat up the time it was supposed to save.
+
+The last three pull against each other: remembering more means computing more slowly. @arora2024simple call this the recall–throughput tradeoff. The paper's elu + 1 sits at the "fast" end: it is non-negative and cheap, but it doesn't raise the dimension, so its capacity is the smallest.
+
+### Back to Qwen3.5: where things went next
+
+Following these rules, later work split into roughly two paths.
+
+**Path 1: a better $\phi$.** Examples include Performer [@choromanski2021rethinking], which approximates the exp kernel with random features; Based [@arora2024simple], which uses the second-order Taylor expansion of exp as its features; and Hedgehog [@zhang2024hedgehog], which lets $\phi$ learn to imitate softmax. They all work on dimension and discrimination.
+
+**Path 2, which became today's mainstream: don't expand capacity, change how things are written.** The original linear attention only ever adds to $S$ and never deletes anything, so old information piles up and interferes. Later models changed the update rule in two ways:
+
+- **Forgetting**: decay $S$ a little at every step, $S_t = \alpha_t S_{t-1} + \phi(k_t)\, v_t^\top$ (with $0 < \alpha_t < 1$, either a fixed constant or determined by the input), so old information fades out and makes room for new information. RetNet [@sun2023retentive], GLA [@yang2024gated] and Mamba-2 [@dao2024transformers] all belong here.
+- **Erase before writing**: before writing a key, first read out the old content stored under that key in $S$, then replace it with the new value. This is the delta rule [@schlag2021linear].
+
+The Gated DeltaNet [@yang2025gated] used in Qwen3.5 combines the two: the gate handles forgetting, and the delta rule handles precise rewriting.
+
+**So why keep a quarter of the layers as standard attention?** The usual explanation is that, however the update rule changes, a fixed-size state will always forget. When precise retrieval is needed, such as recalling one exact sentence from a long document, you still need standard attention, which can see the entire history. The hybrid design lets most layers process information with cheap linear attention, while a few standard attention layers handle precise "lookups".
+
+## References
+
+::: {#refs}
+:::

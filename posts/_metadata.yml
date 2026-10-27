@@ -9,3 +9,17 @@ title-block-banner: true
 
 author: "Mxandre"
 date-format: iso
+
+# Comments at the bottom of every post, stored in GitHub Discussions via giscus
+comments:
+  giscus:
+    repo: Mxandre/mxandre.github.io
+    repo-id: R_kgDOVUr07w
+    category: Comment
+    category-id: DIC_kwDOVUr0784DJvHM
+    mapping: pathname
+    reactions-enabled: true
+    language: zh-CN
+    theme:
+      light: light
+      dark: dark

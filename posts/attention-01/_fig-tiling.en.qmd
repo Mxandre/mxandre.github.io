@@ -1,0 +1,56 @@
+```{=html}
+<svg viewBox="0 0 680 300" width="100%" role="img" aria-labelledby="fig-tiling-title" style="display:block; max-width:680px; margin:0 auto;">
+<title id="fig-tiling-title">FlashAttention splits the 4×4 score table into 2×2 blocks and computes them one by one</title>
+<defs>
+<marker id="ft-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+</defs>
+<rect x="110" y="70" width="176" height="176" fill="currentColor" fill-opacity="0.06"/>
+<rect x="110" y="70" width="88" height="88" fill="#EF9F27" fill-opacity="0.25"/>
+<path d="M154 70V246M242 70V246M110 114H286M110 202H286" fill="none" stroke="currentColor" stroke-opacity="0.3" stroke-width="0.6" stroke-dasharray="3 3"/>
+<path d="M198 70V246M110 158H286" fill="none" stroke="currentColor" stroke-opacity="0.8" stroke-width="1.6"/>
+<rect x="110" y="70" width="176" height="176" fill="none" stroke="currentColor" stroke-opacity="0.8" stroke-width="1.6"/>
+<rect x="110" y="70" width="88" height="88" fill="none" stroke="#EF9F27" stroke-width="2.2"/>
+<g fill="none" stroke="currentColor" stroke-opacity="0.7" stroke-width="1">
+<circle cx="132" cy="92" r="12"/>
+<circle cx="132" cy="180" r="12"/>
+<circle cx="220" cy="92" r="12"/>
+<circle cx="220" cy="180" r="12"/>
+</g>
+<g fill="currentColor" font-size="15" text-anchor="middle" dominant-baseline="central">
+<text x="132" y="92">1</text>
+<text x="132" y="180">2</text>
+<text x="220" y="92">3</text>
+<text x="220" y="180">4</text>
+</g>
+<g fill="currentColor" font-size="15">
+<text x="132" y="60" text-anchor="middle">we</text>
+<text x="176" y="60" text-anchor="middle">ate</text>
+<text x="220" y="60" text-anchor="middle">red</text>
+<text x="264" y="60" text-anchor="middle">fish</text>
+<text x="100" y="92" text-anchor="end" dominant-baseline="central">we</text>
+<text x="100" y="136" text-anchor="end" dominant-baseline="central">ate</text>
+<text x="100" y="180" text-anchor="end" dominant-baseline="central">red</text>
+<text x="100" y="224" text-anchor="end" dominant-baseline="central">fish</text>
+</g>
+<g fill="currentColor" fill-opacity="0.75" font-size="15">
+<text x="100" y="34" text-anchor="end">query</text>
+<text x="198" y="34" text-anchor="middle">key</text>
+<text x="198" y="282" text-anchor="middle">Order: 1 → 2 → 3 → 4</text>
+</g>
+<rect x="340" y="56" width="300" height="110" rx="8" fill="#EF9F27" fill-opacity="0.15" stroke="#EF9F27" stroke-width="1.2"/>
+<rect x="340" y="196" width="300" height="80" rx="8" fill="currentColor" fill-opacity="0.06" stroke="currentColor" stroke-opacity="0.45" stroke-width="1"/>
+<line x1="490" y1="192" x2="490" y2="170" stroke="currentColor" stroke-width="1" marker-start="url(#ft-arrow)" marker-end="url(#ft-arrow)"/>
+<g fill="currentColor" font-size="16" font-weight="bold">
+<text x="356" y="82">SRAM workbench (step 1)</text>
+<text x="356" y="222">HBM warehouse (always)</text>
+</g>
+<g fill="currentColor" font-size="15">
+<text x="356" y="108">K₁, V₁: keys, values of words 1–2</text>
+<text x="356" y="132">Q₁ and current O₁, m₁, ℓ₁</text>
+<text x="356" y="156">2×2 score block S₁₁, then dropped</text>
+<text x="356" y="246">Q, K, V, O, plus m, ℓ per row</text>
+<text x="356" y="268">no N×N matrix at all</text>
+</g>
+<text x="500" y="186" fill="currentColor" fill-opacity="0.75" font-size="14">read / write</text>
+</svg>
+```

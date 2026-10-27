@@ -1,0 +1,81 @@
+```{=html}
+<svg viewBox="0 0 680 510" width="100%" role="img" aria-labelledby="fig-pairs-title" style="display:block; max-width:680px; margin:0 auto;">
+<title id="fig-pairs-title">N 个词两两配对打分，代价随 N 的平方增长</title>
+<g stroke="currentColor" stroke-opacity="0.22" stroke-width="0.8" stroke-linecap="round">
+<line x1="76" y1="80" x2="76" y2="200"/>
+<line x1="76" y1="80" x2="140" y2="200"/>
+<line x1="76" y1="80" x2="204" y2="200"/>
+<line x1="76" y1="80" x2="268" y2="200"/>
+<line x1="140" y1="80" x2="76" y2="200"/>
+<line x1="140" y1="80" x2="140" y2="200"/>
+<line x1="140" y1="80" x2="204" y2="200"/>
+<line x1="140" y1="80" x2="268" y2="200"/>
+<line x1="204" y1="80" x2="76" y2="200"/>
+<line x1="204" y1="80" x2="140" y2="200"/>
+<line x1="204" y1="80" x2="204" y2="200"/>
+<line x1="204" y1="80" x2="268" y2="200"/>
+</g>
+<g stroke="#EF9F27" stroke-width="1.6" stroke-linecap="round">
+<line x1="268" y1="80" x2="76" y2="200"/>
+<line x1="268" y1="80" x2="140" y2="200"/>
+<line x1="268" y1="80" x2="204" y2="200"/>
+<line x1="268" y1="80" x2="268" y2="200"/>
+</g>
+<g fill="currentColor" fill-opacity="0.06" stroke="currentColor" stroke-opacity="0.4" stroke-width="0.8">
+<rect x="50" y="48" width="52" height="32" rx="6"/>
+<rect x="114" y="48" width="52" height="32" rx="6"/>
+<rect x="178" y="48" width="52" height="32" rx="6"/>
+<rect x="50" y="200" width="52" height="32" rx="6"/>
+<rect x="114" y="200" width="52" height="32" rx="6"/>
+<rect x="178" y="200" width="52" height="32" rx="6"/>
+<rect x="242" y="200" width="52" height="32" rx="6"/>
+</g>
+<rect x="242" y="48" width="52" height="32" rx="6" fill="#EF9F27" fill-opacity="0.25" stroke="#EF9F27" stroke-width="1.2"/>
+<g fill="currentColor" font-size="18" text-anchor="middle" dominant-baseline="central">
+<text x="76" y="64">我</text>
+<text x="140" y="64">爱</text>
+<text x="204" y="64">吃</text>
+<text x="268" y="64" font-weight="bold">苹果</text>
+<text x="76" y="216">我</text>
+<text x="140" y="216">爱</text>
+<text x="204" y="216">吃</text>
+<text x="268" y="216">苹果</text>
+</g>
+<rect x="420" y="66" width="144" height="108" fill="currentColor" fill-opacity="0.06"/>
+<rect x="420" y="174" width="144" height="36" fill="#EF9F27" fill-opacity="0.25"/>
+<rect x="420" y="66" width="144" height="144" fill="none" stroke="currentColor" stroke-opacity="0.45" stroke-width="0.8"/>
+<path d="M456 66V210M492 66V210M528 66V210M420 102H564M420 138H564M420 174H564" fill="none" stroke="currentColor" stroke-opacity="0.3" stroke-width="0.6"/>
+<g fill="currentColor" font-size="15">
+<text x="438" y="58" text-anchor="middle">我</text>
+<text x="474" y="58" text-anchor="middle">爱</text>
+<text x="510" y="58" text-anchor="middle">吃</text>
+<text x="546" y="58" text-anchor="middle">苹果</text>
+<text x="412" y="84" text-anchor="end" dominant-baseline="central">我</text>
+<text x="412" y="120" text-anchor="end" dominant-baseline="central">爱</text>
+<text x="412" y="156" text-anchor="end" dominant-baseline="central">吃</text>
+<text x="412" y="192" text-anchor="end" dominant-baseline="central">苹果</text>
+</g>
+<g fill="currentColor" fill-opacity="0.06" stroke="currentColor" stroke-opacity="0.45" stroke-width="0.8">
+<rect x="150" y="408" width="32" height="32"/>
+<rect x="260" y="376" width="64" height="64"/>
+<rect x="400" y="312" width="128" height="128"/>
+</g>
+<g fill="none" stroke="currentColor" stroke-opacity="0.3" stroke-width="0.6">
+<path d="M158 408V440M166 408V440M174 408V440M150 416H182M150 424H182M150 432H182"/>
+<path d="M268 376V440M276 376V440M284 376V440M292 376V440M300 376V440M308 376V440M316 376V440M260 384H324M260 392H324M260 400H324M260 408H324M260 416H324M260 424H324M260 432H324"/>
+<path d="M408 312V440M416 312V440M424 312V440M432 312V440M440 312V440M448 312V440M456 312V440M464 312V440M472 312V440M480 312V440M488 312V440M496 312V440M504 312V440M512 312V440M520 312V440M400 320H528M400 328H528M400 336H528M400 344H528M400 352H528M400 360H528M400 368H528M400 376H528M400 384H528M400 392H528M400 400H528M400 408H528M400 416H528M400 424H528M400 432H528"/>
+</g>
+<g fill="currentColor" fill-opacity="0.75" font-size="15">
+<text x="50" y="36">query</text>
+<text x="50" y="252">key</text>
+<text x="172" y="282" text-anchor="middle">4 个词两两配对：16 条连线</text>
+<text x="412" y="36" text-anchor="end">query</text>
+<text x="492" y="36" text-anchor="middle">key</text>
+<text x="492" y="282" text-anchor="middle">分数矩阵：4 × 4 = 16 格</text>
+<text x="166" y="462" text-anchor="middle">N = 4：16 格</text>
+<text x="292" y="462" text-anchor="middle">N = 8：64 格</text>
+<text x="464" y="462" text-anchor="middle">N = 16：256 格</text>
+<text x="340" y="490" text-anchor="middle">N 每翻一倍，格子数（计算量、显存）变成 4 倍</text>
+</g>
+</svg>
+```
