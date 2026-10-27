@@ -4,3 +4,33 @@ body {
     "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
   line-height: 1.8;
 }
+
+/* 过宽的公式和表格在自身范围内左右滚动，不把整页撑宽（手机上尤其明显）。
+   MathJax 会给带编号的公式设一个最小宽度，需要覆盖掉才能滚动。 */
+mjx-container[display="true"] {
+  overflow-x: auto;
+  overflow-y: hidden;
+  min-width: 0 !important;
+  max-width: 100%;
+}
+
+.quarto-float-tbl > div {
+  overflow-x: auto;
+}
+
+/* 导航栏的中英双语标题较长：窄屏时允许换行，英文部分（用不换行空格连着）整体落到第二行 */
+@media (max-width: 991.98px) {
+  .navbar-brand,
+  .navbar-title {
+    white-space: normal;
+    text-align: center;
+  }
+}
+
+@media (max-width: 575.98px) {
+  .navbar-brand,
+  .navbar-title {
+    font-size: 1rem;
+    line-height: 1.3;
+  }
+}

@@ -1,5 +1,5 @@
 ---
-title: "技术调研笔记"
+title: "技术调研笔记 · Tech\u00A0Research\u00A0Notes"
 listing:
   contents: "posts/*/index.qmd"
   feed: true

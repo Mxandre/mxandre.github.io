@@ -4,7 +4,8 @@ project:
 lang: zh
 
 website:
-  title: "技术调研笔记"
+  # Tech、Research、Notes 之间是不换行空格 \u00A0：窄屏换行时英文部分整体落到第二行
+  title: "技术调研笔记 · Tech\u00A0Research\u00A0Notes"
   description: "工程 + 理论视角的技术调研"
   site-url: https://mxandre.github.io
   navbar:
