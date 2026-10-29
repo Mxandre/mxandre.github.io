@@ -1,14 +1,35 @@
 ---
 title: "技术调研笔记 · Tech\u00A0Research\u00A0Notes"
 listing:
-  contents: "posts/*/index.qmd"
-  feed: true
-  sort: "date desc"
-  type: default
-  categories: true
-  sort-ui: false
-  filter-ui: false
-  date-format: iso
+  - id: posts-zh
+    contents: "posts/*/index.qmd"
+    feed: true
+    sort: "date desc"
+    type: default
+    categories: true
+    sort-ui: false
+    filter-ui: false
+    date-format: iso
+  - id: posts-en
+    contents: "posts/*/en.qmd"
+    sort: "date desc"
+    type: default
+    sort-ui: false
+    filter-ui: false
+    date-format: iso
 page-layout: full
 title-block-banner: true
+toc: false
 ---
+
+## 中文
+
+::: {#posts-zh}
+:::
+
+## English
+
+Posts are mainly written in Chinese; the ones with English versions are listed here.
+
+::: {#posts-en}
+:::

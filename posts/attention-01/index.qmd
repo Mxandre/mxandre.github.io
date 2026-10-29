@@ -1,6 +1,7 @@
 ---
 title: "让 Attention 更快（1）：Linear Attention 与 FlashAttention"
 subtitle: "两种思路：改「算什么」，还是改「怎么算」"
+description: "attention 的代价随序列长度平方增长。FlashAttention 不改数学，只改计算的组织方式；Linear Attention 换一种计算相似度的方式，让计算量从平方降到线性。"
 date: "2026-10-26"
 categories: [attention, linear-attention, flash-attention]
 bibliography: references.bib

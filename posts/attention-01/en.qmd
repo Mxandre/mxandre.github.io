@@ -1,6 +1,7 @@
 ---
 title: "Making Attention Faster (1): Linear Attention and FlashAttention"
 subtitle: "Two ideas: change *what* we compute, or *how* we compute it"
+description: "Attention's cost grows with the square of the sequence length. FlashAttention keeps the math and only changes how the computation is organized; linear attention measures similarity differently, so the computation drops from quadratic to linear."
 date: "2026-10-26"
 categories: [attention, linear-attention, flash-attention]
 bibliography: references.bib

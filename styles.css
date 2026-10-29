@@ -5,6 +5,16 @@ body {
   line-height: 1.8;
 }
 
+/* 文章摘要（description）只用在首页列表和搜索引擎里，文章页顶部不重复显示 */
+#title-block-header .description {
+  display: none;
+}
+
+/* 首页中英两栏会把同一篇文章算两次，分类面板不显示篇数 */
+.quarto-category-count {
+  display: none;
+}
+
 /* 过宽的公式和表格在自身范围内左右滚动，不把整页撑宽（手机上尤其明显）。
    MathJax 会给带编号的公式设一个最小宽度，需要覆盖掉才能滚动。 */
 mjx-container[display="true"] {
